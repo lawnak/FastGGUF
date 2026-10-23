@@ -173,8 +173,7 @@ Qwen2 MoE (shared experts), GPT-OSS, vision/multimodal projectors, embedding mod
 
 ### Operating systems
 
-Windows 10/11, Linux, macOS. On Windows nothing needs installing: a w64devkit build is a single `.exe`; the
-prebuilt download from GitHub Actions (built with MSYS2) has its few runtime DLLs in the same folder.
+Windows 10/11, Linux, macOS. The prebuilt Windows download is a single static `.exe` — nothing to install.
 
 ### CPUs
 
@@ -371,13 +370,15 @@ Windows example: `set FASTGGUF_KV=turbo` then `fastgguf.exe chat model.gguf 1638
 | Platform | Command |
 |---|---|
 | Linux (gcc) | `make` |
-| Windows (w64devkit or MSYS2 UCRT64) | `build.bat`, or `make` inside MSYS2 |
+| Windows (w64devkit or MSYS2 UCRT64) | `build.bat`, or `make` inside MSYS2 (`pacman -S make mingw-w64-ucrt-x86_64-toolchain`) |
+| Windows `.exe` from Linux (cross-compile) | `make portable OS=Windows_NT CC=x86_64-w64-mingw32-gcc` |
 | macOS (Apple clang, single-threaded) | `make fastgguf CC=clang CFLAGS="-O3" LDLIBS="-lm"` |
 | macOS with OpenMP (`brew install gcc`) | `make CC=gcc-14 ARCH=` |
 | Portable binary for other PCs (AVX2) | `make portable` or `build.bat portable` |
 
 By hand: `gcc -O3 -march=native -fopenmp -o fastgguf fastgguf.c -lm -ldl`
-(Windows: replace `-ldl` with `-lws2_32 -static`).
+(Windows: replace `-ldl` with `-lws2_32 -static`). The Makefile builds single-threaded with a warning if the
+compiler has no OpenMP library.
 
 Every push is built and tested on Linux, Windows and macOS by
 [GitHub Actions](.github/workflows/build.yml).
