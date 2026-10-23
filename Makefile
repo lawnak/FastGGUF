@@ -15,7 +15,13 @@ SRC      = fastgguf.c
 ifeq ($(OS),Windows_NT)
   EXE     = .exe
   LDLIBS  = -lm -lws2_32
-  LDFLAGS = -static
+  # fully static .exe when the toolchain has a static OpenMP library (w64devkit, mingw-w64);
+  # MSYS2 ships libgomp only as a DLL, so then keep libgomp-1.dll next to the .exe
+  ifneq ($(wildcard $(shell $(CC) -print-file-name=libgomp.a)),)
+    LDFLAGS = -static
+  else
+    LDFLAGS = -static-libgcc
+  endif
 else
   EXE     =
   LDLIBS  = -lm -ldl

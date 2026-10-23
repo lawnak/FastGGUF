@@ -49,6 +49,8 @@ jobs:
           install: make mingw-w64-ucrt-x86_64-gcc
       - name: Build (portable AVX2, static)
         run: make portable
+      - name: Bundle runtime DLLs
+        run: ldd fastgguf.exe | grep -i ucrt64 | awk '{print $3}' | xargs -r -I{} cp {} .
       - name: Self-test
         run: ./fastgguf.exe selftest
       - uses: actions/upload-artifact@v4
@@ -58,6 +60,7 @@ jobs:
             fastgguf.exe
             fastgguf-server.exe
             fastgguf-console.exe
+            *.dll
             chat.bat
             server.bat
 
