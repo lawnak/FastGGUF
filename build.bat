@@ -11,7 +11,12 @@ set ARCH=-march=native
 if /i "%1"=="portable" set ARCH=-march=x86-64-v3
 set FLAGS=-O3 %ARCH% -fopenmp -static
 echo [1/3] fastgguf.exe
-gcc %FLAGS% -o fastgguf.exe fastgguf.c -lm -lws2_32 || exit /b 1
+gcc %FLAGS% -o fastgguf.exe fastgguf.c -lm -lws2_32 2>nul || (
+  rem MSYS2 has no static OpenMP library: link it dynamically instead
+  set FLAGS=-O3 %ARCH% -fopenmp -static-libgcc
+  echo   static OpenMP not available - linking dynamically ^(keep libgomp-1.dll next to the .exe^)
+  gcc -O3 %ARCH% -fopenmp -static-libgcc -o fastgguf.exe fastgguf.c -lm -lws2_32 || exit /b 1
+)
 echo [2/3] fastgguf-server.exe
 gcc %FLAGS% -DFG_SERVER_MAIN -o fastgguf-server.exe fastgguf.c -lm -lws2_32 || exit /b 1
 echo [3/3] fastgguf-console.exe

@@ -173,7 +173,8 @@ Qwen2 MoE (shared experts), GPT-OSS, vision/multimodal projectors, embedding mod
 
 ### Operating systems
 
-Windows 10/11, Linux, macOS. Windows builds are static `.exe` files (no DLLs to install).
+Windows 10/11, Linux, macOS. On Windows nothing needs installing: a w64devkit build is a single `.exe`; the
+prebuilt download from GitHub Actions (built with MSYS2) has its few runtime DLLs in the same folder.
 
 ### CPUs
 
