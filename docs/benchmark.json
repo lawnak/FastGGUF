@@ -1,0 +1,90 @@
+{
+  "cpu": "Intel Xeon @ 2.10GHz (cloud VM, 4 vCPU, AVX-512/VNNI)",
+  "tokens": 128,
+  "runs": 3,
+  "rows": [
+    {
+      "model": "qwen2.5-0.5b-q4_0",
+      "gb": 0.281,
+      "fastgguf": 42.99,
+      "llamacpp": 128.08
+    },
+    {
+      "model": "qwen2.5-0.5b-q8_0",
+      "gb": 0.528,
+      "fastgguf": 33.48,
+      "llamacpp": 68.27
+    },
+    {
+      "model": "qwen2.5-0.5b-q4_k_m",
+      "gb": 0.395,
+      "fastgguf": 7.1,
+      "llamacpp": 44.98
+    },
+    {
+      "model": "llama-3.2-1b-q4_0",
+      "gb": 0.698,
+      "fastgguf": 14.84,
+      "llamacpp": 50.06
+    },
+    {
+      "model": "llama-3.2-1b-q8_0",
+      "gb": 1.316,
+      "fastgguf": 13.82,
+      "llamacpp": 29.67
+    },
+    {
+      "model": "llama-3.2-1b-q4_k_m",
+      "gb": 0.803,
+      "fastgguf": 10.21,
+      "llamacpp": 24.3
+    },
+    {
+      "model": "gemma-3-1b-q4_k_m",
+      "gb": 0.806,
+      "fastgguf": 3.96,
+      "llamacpp": 25.36
+    },
+    {
+      "model": "qwen2.5-1.5b-q4_k_m",
+      "gb": 0.983,
+      "fastgguf": 10.23,
+      "llamacpp": 20.54
+    },
+    {
+      "model": "llama-3.2-3b-q4_k_m",
+      "gb": 2.014,
+      "fastgguf": 5.08,
+      "llamacpp": 11.21
+    },
+    {
+      "model": "qwen3-4b-q4_k_m",
+      "gb": 2.495,
+      "fastgguf": 3.74,
+      "llamacpp": 8.96
+    },
+    {
+      "model": "llama-3.1-8b-q4_k_m",
+      "gb": 4.916,
+      "fastgguf": 2.32,
+      "llamacpp": 4.72
+    }
+  ],
+  "threads": [
+    {
+      "threads": 1,
+      "fastgguf": 3.27,
+      "llamacpp": 6.94
+    },
+    {
+      "threads": 2,
+      "fastgguf": 6.12,
+      "llamacpp": 12.7
+    },
+    {
+      "threads": 4,
+      "fastgguf": 10.64,
+      "llamacpp": 23.21
+    }
+  ]
+}

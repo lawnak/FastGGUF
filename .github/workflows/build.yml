@@ -1,0 +1,72 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (portable AVX2)
+        run: make portable
+      - name: Self-test
+        run: ./fastgguf selftest
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Server smoke test (tiny synthetic model)
+        run: |
+          pip install gguf numpy
+          python tools/synth_gguf.py tiny-test q8_0 tiny.gguf
+          ./fastgguf inspect tiny.gguf
+          ./fastgguf serve tiny.gguf 8080 512 > server.log 2>&1 &
+          for i in $(seq 30); do curl -sf http://localhost:8080/v1/models && break; sleep 1; done
+          curl -sf http://localhost:8080/ | grep -q fastgguf
+          curl -sf http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+            -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":8}' | tee reply.json
+          grep -q '"choices"' reply.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastgguf-linux-x86_64
+          path: |
+            fastgguf
+            fastgguf-server
+            fastgguf-console
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: make mingw-w64-ucrt-x86_64-gcc
+      - name: Build (portable AVX2, static)
+        run: make portable
+      - name: Self-test
+        run: ./fastgguf.exe selftest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastgguf-windows-x86_64
+          path: |
+            fastgguf.exe
+            fastgguf-server.exe
+            fastgguf-console.exe
+            chat.bat
+            server.bat
+
+  macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      # Apple clang has no OpenMP and Apple Silicon has no AVX2: single-thread scalar path
+      - name: Build
+        run: make fastgguf CC=clang CFLAGS="-O3 -Wall" LDLIBS="-lm"
+      - name: Self-test
+        run: ./fastgguf selftest
