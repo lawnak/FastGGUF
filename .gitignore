@@ -1,0 +1,8 @@
+fastgguf
+fastgguf-server
+fastgguf-console
+*.exe
+*.o
+*.gguf
+models/
+__pycache__/

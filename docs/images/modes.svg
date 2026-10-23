@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 400" width="1000" height="400" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+  <title>Server modes: single, parallel, chain and loop</title>
+  <style>
+    .bg { fill: #fcfcfb; }
+    .panel { fill: #f1f0ec; }
+    .q { fill: #ffffff; stroke: #b9b7ae; stroke-width: 1; }
+    .m1 { fill: #2a78d6; } .m2 { fill: #eb6834; } .m3 { fill: #1baf7a; }
+    .ans { fill: #ffffff; stroke: #1baf7a; stroke-width: 1.5; }
+    .h { fill: #0b0b0b; font-size: 16px; font-weight: 650; }
+    .t { fill: #52514e; font-size: 12.5px; }
+    .w { fill: #ffffff; font-size: 12.5px; font-weight: 600; }
+    .k { fill: #0b0b0b; font-size: 12.5px; }
+    .code { fill: #52514e; font-size: 11.5px; font-family: ui-monospace, Consolas, monospace; }
+    .ar { stroke: #8a8984; stroke-width: 1.5; fill: none; marker-end: url(#a); }
+    .ah { fill: #8a8984; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #1a1a19; } .panel { fill: #262624; }
+      .q { fill: #1a1a19; stroke: #55544f; } .ans { fill: #1a1a19; stroke: #199e70; }
+      .m1 { fill: #3987e5; } .m2 { fill: #d95926; } .m3 { fill: #199e70; }
+      .h, .k { fill: #f0efec; } .t, .code { fill: #c3c2b7; }
+      .ar { stroke: #8f8e86; } .ah { fill: #8f8e86; }
+    }
+  </style>
+  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+  <rect class="bg" width="1000" height="400" rx="12"/>
+
+  <!-- single -->
+  <rect class="panel" x="16" y="16" width="232" height="368" rx="10"/>
+  <text class="h" x="32" y="44">single</text>
+  <text class="t" x="32" y="64">one model answers</text>
+  <rect class="q" x="74" y="92" width="116" height="34" rx="8"/><text class="k" x="106" y="114">question</text>
+  <path class="ar" d="M132,126 V160"/>
+  <rect class="m1" x="74" y="162" width="116" height="40" rx="8"/><text class="w" x="104" y="187">model A</text>
+  <path class="ar" d="M132,202 V236"/>
+  <rect class="ans" x="74" y="238" width="116" height="34" rx="8"/><text class="k" x="110" y="260">answer</text>
+  <text class="code" x="32" y="338">"model": "A"</text>
+  <text class="t" x="32" y="362">default mode</text>
+
+  <!-- parallel -->
+  <rect class="panel" x="264" y="16" width="232" height="368" rx="10"/>
+  <text class="h" x="280" y="44">parallel</text>
+  <text class="t" x="280" y="64">all models answer the question</text>
+  <rect class="q" x="322" y="92" width="116" height="34" rx="8"/><text class="k" x="354" y="114">question</text>
+  <path class="ar" d="M350,126 L310,160"/><path class="ar" d="M380,126 V160"/><path class="ar" d="M410,126 L450,160"/>
+  <rect class="m1" x="278" y="162" width="64" height="40" rx="8"/><text class="w" x="302" y="187">A</text>
+  <rect class="m2" x="348" y="162" width="64" height="40" rx="8"/><text class="w" x="372" y="187">B</text>
+  <rect class="m3" x="418" y="162" width="64" height="40" rx="8"/><text class="w" x="442" y="187">C</text>
+  <path class="ar" d="M310,202 V236"/><path class="ar" d="M380,202 V236"/><path class="ar" d="M450,202 V236"/>
+  <rect class="ans" x="278" y="238" width="64" height="34" rx="8"/><text class="k" x="290" y="260">ans A</text>
+  <rect class="ans" x="348" y="238" width="64" height="34" rx="8"/><text class="k" x="360" y="260">ans B</text>
+  <rect class="ans" x="418" y="238" width="64" height="34" rx="8"/><text class="k" x="430" y="260">ans C</text>
+  <text class="code" x="280" y="338">"mode": "parallel"</text>
+  <text class="t" x="280" y="362">compare models side by side</text>
+
+  <!-- chain -->
+  <rect class="panel" x="512" y="16" width="232" height="368" rx="10"/>
+  <text class="h" x="528" y="44">chain</text>
+  <text class="t" x="528" y="64">each model refines the last one</text>
+  <rect class="q" x="570" y="80" width="116" height="30" rx="8"/><text class="k" x="602" y="100">question</text>
+  <path class="ar" d="M628,110 V124"/>
+  <rect class="m1" x="570" y="126" width="116" height="34" rx="8"/><text class="w" x="590" y="148">A writes draft</text>
+  <path class="ar" d="M628,160 V174"/>
+  <rect class="m2" x="570" y="176" width="116" height="34" rx="8"/><text class="w" x="594" y="198">B improves</text>
+  <path class="ar" d="M628,210 V224"/>
+  <rect class="m3" x="570" y="226" width="116" height="34" rx="8"/><text class="w" x="594" y="248">C improves</text>
+  <path class="ar" d="M628,260 V274"/>
+  <rect class="ans" x="570" y="276" width="116" height="30" rx="8"/><text class="k" x="594" y="296">final answer</text>
+  <text class="code" x="528" y="338">"mode": "chain"</text>
+  <text class="t" x="528" y="362">needs 2+ models</text>
+
+  <!-- loop -->
+  <rect class="panel" x="760" y="16" width="224" height="368" rx="10"/>
+  <text class="h" x="776" y="44">loop</text>
+  <text class="t" x="776" y="64">the chain repeated N rounds</text>
+  <rect class="q" x="814" y="92" width="116" height="34" rx="8"/><text class="k" x="846" y="114">question</text>
+  <path class="ar" d="M872,126 V160"/>
+  <rect class="m1" x="814" y="162" width="116" height="40" rx="8"/><text class="w" x="824" y="187">A → B → … again</text>
+  <path class="ar" d="M930,170 C 970,170 970,196 932,196"/>
+  <text class="t" x="944" y="160">× N</text>
+  <path class="ar" d="M872,202 V236"/>
+  <rect class="ans" x="814" y="238" width="116" height="34" rx="8"/><text class="k" x="838" y="260">final answer</text>
+  <text class="code" x="776" y="338">"mode": "loop", "rounds": 2</text>
+  <text class="t" x="776" y="362">works with a single model too</text>
+</svg>

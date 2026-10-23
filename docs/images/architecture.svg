@@ -1,0 +1,117 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 620" width="1000" height="620" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+  <title>fastgguf architecture: from a GGUF file to streamed text</title>
+  <style>
+    .bg { fill: #fcfcfb; }
+    .box { fill: #f1f0ec; stroke: #d6d4cc; stroke-width: 1; }
+    .cpu { fill: #e6effa; stroke: #2a78d6; stroke-width: 1.5; }
+    .gpu { fill: #fdeee7; stroke: #eb6834; stroke-width: 1.5; }
+    .io  { fill: #e7f6f0; stroke: #1baf7a; stroke-width: 1.5; }
+    .h  { fill: #0b0b0b; font-size: 15px; font-weight: 650; }
+    .t  { fill: #52514e; font-size: 12px; }
+    .s  { fill: #52514e; font-size: 12.5px; }
+    .sec { fill: #6b6a65; font-size: 11px; font-weight: 600; letter-spacing: .08em; }
+    .ar { stroke: #8a8984; stroke-width: 1.5; fill: none; marker-end: url(#a); }
+    .ah { fill: #8a8984; }
+    .dash { stroke: #b9b7ae; stroke-width: 1.2; stroke-dasharray: 4 4; fill: none; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #1a1a19; }
+      .box { fill: #262624; stroke: #3d3d3a; }
+      .cpu { fill: #1c2a3d; stroke: #3987e5; }
+      .gpu { fill: #3a2219; stroke: #d95926; }
+      .io  { fill: #16302a; stroke: #199e70; }
+      .h { fill: #f0efec; } .t, .s { fill: #c3c2b7; } .sec { fill: #9a998f; }
+      .ar { stroke: #8f8e86; } .ah { fill: #8f8e86; } .dash { stroke: #55544f; }
+    }
+  </style>
+  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+  <rect class="bg" width="1000" height="620" rx="12"/>
+
+  <text class="sec" x="24" y="32">ONE TOKEN, START TO FINISH</text>
+
+  <!-- pipeline -->
+  <rect class="box" x="24" y="46" width="170" height="92" rx="10"/>
+  <text class="h" x="40" y="74">model.gguf</text>
+  <text class="t" x="40" y="96">memory-mapped (mmap)</text>
+  <text class="t" x="40" y="113">no copy, loads in seconds</text>
+  <text class="t" x="40" y="130">15 weight types</text>
+
+  <rect class="box" x="220" y="46" width="170" height="92" rx="10"/>
+  <text class="h" x="236" y="74">Tokenizer</text>
+  <text class="t" x="236" y="96">SentencePiece or BPE</text>
+  <text class="t" x="236" y="113">chat template detected</text>
+  <text class="t" x="236" y="130">from the file</text>
+
+  <rect class="box" x="416" y="46" width="170" height="92" rx="10"/>
+  <text class="h" x="432" y="74">Transformer</text>
+  <text class="t" x="432" y="96">N layers, see below</text>
+  <text class="t" x="432" y="113">KV cache reused across</text>
+  <text class="t" x="432" y="130">messages</text>
+
+  <rect class="box" x="612" y="46" width="170" height="92" rx="10"/>
+  <text class="h" x="628" y="74">Sampler</text>
+  <text class="t" x="628" y="96">repeat penalty, temp,</text>
+  <text class="t" x="628" y="113">top-k, top-p, seed</text>
+  <text class="t" x="628" y="130">(temp 0 = greedy)</text>
+
+  <rect class="io" x="808" y="46" width="168" height="92" rx="10"/>
+  <text class="h" x="824" y="74">Text out</text>
+  <text class="t" x="824" y="96">streamed token by token</text>
+  <text class="t" x="824" y="113">UTF-8 safe (Arabic,</text>
+  <text class="t" x="824" y="130">emoji, CJK)</text>
+
+  <path class="ar" d="M194,92 H218"/>
+  <path class="ar" d="M390,92 H414"/>
+  <path class="ar" d="M586,92 H610"/>
+  <path class="ar" d="M782,92 H806"/>
+  <path class="dash" d="M612,150 C 560,190 470,190 440,160"/>
+  <text class="t" x="470" y="196">next token goes back in</text>
+
+  <!-- layer detail -->
+  <text class="sec" x="24" y="232">INSIDE EACH LAYER</text>
+  <rect class="box" x="24" y="246" width="952" height="132" rx="10"/>
+  <g>
+    <rect class="bg" x="40" y="266" width="112" height="44" rx="8"/>
+    <text class="s" x="52" y="293">RMSNorm</text>
+    <rect class="bg" x="172" y="266" width="132" height="44" rx="8"/>
+    <text class="s" x="184" y="286">Q, K, V projections</text>
+    <text class="t" x="184" y="302">+ bias, q/k norm</text>
+    <rect class="bg" x="324" y="266" width="92" height="44" rx="8"/>
+    <text class="s" x="338" y="293">RoPE</text>
+    <rect class="bg" x="436" y="266" width="152" height="44" rx="8"/>
+    <text class="s" x="448" y="286">Attention</text>
+    <text class="t" x="448" y="302">GQA, sliding window</text>
+    <rect class="bg" x="608" y="266" width="112" height="44" rx="8"/>
+    <text class="s" x="620" y="293">Out + norm</text>
+    <rect class="bg" x="740" y="266" width="220" height="44" rx="8"/>
+    <text class="s" x="752" y="286">FFN: GELU / SiLU</text>
+    <text class="t" x="752" y="302">or MoE: router picks top-k experts</text>
+    <path class="ar" d="M152,288 H170"/><path class="ar" d="M304,288 H322"/>
+    <path class="ar" d="M416,288 H434"/><path class="ar" d="M588,288 H606"/>
+    <path class="ar" d="M720,288 H738"/>
+    <rect class="bg" x="436" y="324" width="284" height="40" rx="8"/>
+    <text class="s" x="448" y="349">KV cache: f32, or TurboQuant 8/4/2-bit (5–9× smaller)</text>
+    <path class="ar" d="M512,322 V312"/>
+  </g>
+
+  <!-- backends -->
+  <text class="sec" x="24" y="414">WHERE THE MATH RUNS (every matrix × vector)</text>
+  <rect class="cpu" x="24" y="428" width="466" height="118" rx="10"/>
+  <text class="h" x="42" y="456">CPU (always available)</text>
+  <text class="s" x="42" y="480">Integer dot products: AVX2, AVX-VNNI, AVX-512 VNNI</text>
+  <text class="s" x="42" y="500">Activations quantized to 8-bit once per matrix</text>
+  <text class="s" x="42" y="520">All cores via OpenMP · plain C fallback on any CPU</text>
+  <text class="s" x="42" y="538">MoE experts read from disk only when chosen</text>
+
+  <rect class="gpu" x="510" y="428" width="466" height="118" rx="10"/>
+  <text class="h" x="528" y="456">GPU (optional, OpenCL)</text>
+  <text class="s" x="528" y="480">NVIDIA, AMD, Intel — same code, no SDK or CUDA</text>
+  <text class="s" x="528" y="500">OpenCL loaded at runtime from the GPU driver</text>
+  <text class="s" x="528" y="520">Model bigger than VRAM: first layers on GPU, rest on CPU</text>
+  <text class="s" x="528" y="538">Self-checked at start; falls back to CPU on any error</text>
+
+  <!-- interfaces -->
+  <rect class="io" x="24" y="562" width="466" height="44" rx="10"/>
+  <text class="s" x="42" y="589"><tspan font-weight="650">fastgguf chat</tspan>  — chat in the terminal</text>
+  <rect class="io" x="510" y="562" width="466" height="44" rx="10"/>
+  <text class="s" x="528" y="589"><tspan font-weight="650">fastgguf serve</tspan>  — web UI + OpenAI-compatible API</text>
+</svg>

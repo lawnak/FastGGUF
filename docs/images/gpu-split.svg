@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 400" width="1000" height="400" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+  <title>Automatic GPU/CPU split for a model bigger than VRAM</title>
+  <style>
+    .bg { fill: #fcfcfb; }
+    .g { fill: #eb6834; } .c { fill: #2a78d6; }
+    .h { fill: #0b0b0b; font-size: 16px; font-weight: 650; }
+    .t { fill: #52514e; font-size: 13px; }
+    .n { fill: #6b6a65; font-size: 11px; }
+    .brace { stroke: #8a8984; stroke-width: 1.2; fill: none; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #1a1a19; } .g { fill: #d95926; } .c { fill: #3987e5; }
+      .h { fill: #f0efec; } .t { fill: #c3c2b7; } .n { fill: #9a998f; } .brace { stroke: #8f8e86; }
+    }
+  </style>
+  <rect class="bg" width="1000" height="400" rx="12"/>
+  <rect class="g" x="40" y="22" width="14" height="14" rx="3"/><text class="t" x="60" y="34">on the GPU (VRAM)</text>
+  <rect class="c" x="200" y="22" width="14" height="14" rx="3"/><text class="t" x="220" y="34">on the CPU (RAM)</text>
+
+  <text class="h" x="40" y="80">Llama 3.1 8B Q4_K_M (4.9 GB) on a 4 GB GPU</text>
+  <text class="t" x="40" y="102">weight budget = 87.5% of VRAM = 3.5 GB  →  about 28 of 32 layers fit, the rest run on the CPU</text>
+  <rect class="g" x="40" y="118" width="22" height="44" rx="4"/><rect class="g" x="66" y="118" width="22" height="44" rx="4"/><rect class="g" x="92" y="118" width="22" height="44" rx="4"/><rect class="g" x="118" y="118" width="22" height="44" rx="4"/><rect class="g" x="144" y="118" width="22" height="44" rx="4"/><rect class="g" x="170" y="118" width="22" height="44" rx="4"/><rect class="g" x="196" y="118" width="22" height="44" rx="4"/><rect class="g" x="222" y="118" width="22" height="44" rx="4"/><rect class="g" x="248" y="118" width="22" height="44" rx="4"/><rect class="g" x="274" y="118" width="22" height="44" rx="4"/><rect class="g" x="300" y="118" width="22" height="44" rx="4"/><rect class="g" x="326" y="118" width="22" height="44" rx="4"/><rect class="g" x="352" y="118" width="22" height="44" rx="4"/><rect class="g" x="378" y="118" width="22" height="44" rx="4"/><rect class="g" x="404" y="118" width="22" height="44" rx="4"/><rect class="g" x="430" y="118" width="22" height="44" rx="4"/><rect class="g" x="456" y="118" width="22" height="44" rx="4"/><rect class="g" x="482" y="118" width="22" height="44" rx="4"/><rect class="g" x="508" y="118" width="22" height="44" rx="4"/><rect class="g" x="534" y="118" width="22" height="44" rx="4"/><rect class="g" x="560" y="118" width="22" height="44" rx="4"/><rect class="g" x="586" y="118" width="22" height="44" rx="4"/><rect class="g" x="612" y="118" width="22" height="44" rx="4"/><rect class="g" x="638" y="118" width="22" height="44" rx="4"/><rect class="g" x="664" y="118" width="22" height="44" rx="4"/><rect class="g" x="690" y="118" width="22" height="44" rx="4"/><rect class="g" x="716" y="118" width="22" height="44" rx="4"/><rect class="g" x="742" y="118" width="22" height="44" rx="4"/><rect class="c" x="768" y="118" width="22" height="44" rx="4"/><rect class="c" x="794" y="118" width="22" height="44" rx="4"/><rect class="c" x="820" y="118" width="22" height="44" rx="4"/><rect class="c" x="846" y="118" width="22" height="44" rx="4"/><rect class="c" x="886" y="118" width="58" height="44" rx="4"/>
+  <text class="n" x="40" y="180">layer 0</text>
+  <text class="n" x="834" y="180">layer 31</text>
+  <text class="n" x="880" y="180">output head</text>
+
+  <text class="h" x="40" y="232">Same model on a 6 GB GPU</text>
+  <text class="t" x="40" y="254">everything fits: all 32 layers + output head on the GPU</text>
+  <rect class="g" x="40" y="268" width="22" height="44" rx="4"/><rect class="g" x="66" y="268" width="22" height="44" rx="4"/><rect class="g" x="92" y="268" width="22" height="44" rx="4"/><rect class="g" x="118" y="268" width="22" height="44" rx="4"/><rect class="g" x="144" y="268" width="22" height="44" rx="4"/><rect class="g" x="170" y="268" width="22" height="44" rx="4"/><rect class="g" x="196" y="268" width="22" height="44" rx="4"/><rect class="g" x="222" y="268" width="22" height="44" rx="4"/><rect class="g" x="248" y="268" width="22" height="44" rx="4"/><rect class="g" x="274" y="268" width="22" height="44" rx="4"/><rect class="g" x="300" y="268" width="22" height="44" rx="4"/><rect class="g" x="326" y="268" width="22" height="44" rx="4"/><rect class="g" x="352" y="268" width="22" height="44" rx="4"/><rect class="g" x="378" y="268" width="22" height="44" rx="4"/><rect class="g" x="404" y="268" width="22" height="44" rx="4"/><rect class="g" x="430" y="268" width="22" height="44" rx="4"/><rect class="g" x="456" y="268" width="22" height="44" rx="4"/><rect class="g" x="482" y="268" width="22" height="44" rx="4"/><rect class="g" x="508" y="268" width="22" height="44" rx="4"/><rect class="g" x="534" y="268" width="22" height="44" rx="4"/><rect class="g" x="560" y="268" width="22" height="44" rx="4"/><rect class="g" x="586" y="268" width="22" height="44" rx="4"/><rect class="g" x="612" y="268" width="22" height="44" rx="4"/><rect class="g" x="638" y="268" width="22" height="44" rx="4"/><rect class="g" x="664" y="268" width="22" height="44" rx="4"/><rect class="g" x="690" y="268" width="22" height="44" rx="4"/><rect class="g" x="716" y="268" width="22" height="44" rx="4"/><rect class="g" x="742" y="268" width="22" height="44" rx="4"/><rect class="g" x="768" y="268" width="22" height="44" rx="4"/><rect class="g" x="794" y="268" width="22" height="44" rx="4"/><rect class="g" x="820" y="268" width="22" height="44" rx="4"/><rect class="g" x="846" y="268" width="22" height="44" rx="4"/><rect class="g" x="886" y="268" width="58" height="44" rx="4"/>
+
+  <text class="t" x="40" y="352">Automatic. Override with FASTGGUF_GPU_LAYERS=N (exact layer count) or FASTGGUF_GPU_MEM=GB (budget).</text>
+  <text class="t" x="40" y="374">Q2_K, Q3_K and IQ4_XS weights always stay on the CPU (no GPU kernel for them yet).</text>
+</svg>
