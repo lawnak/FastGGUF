@@ -36,7 +36,40 @@ jobs:
             fastgguf-server
             fastgguf-console
 
-  windows:
+  # Windows .exe: cross-compiled with mingw-w64 (static, OpenMP included, no DLLs needed)
+  windows-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mingw-w64
+        run: sudo apt-get update -q && sudo apt-get install -y -q gcc-mingw-w64-x86-64
+      - name: Build (portable AVX2, static)
+        run: make portable OS=Windows_NT CC=x86_64-w64-mingw32-gcc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastgguf-windows-x86_64
+          path: |
+            fastgguf.exe
+            fastgguf-server.exe
+            fastgguf-console.exe
+            chat.bat
+            server.bat
+
+  # ...and tested on real Windows
+  windows-test:
+    needs: windows-build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fastgguf-windows-x86_64
+      - name: Self-test
+        run: .\fastgguf.exe selftest
+      - name: GPU probe (no GPU on CI, must not crash)
+        run: .\fastgguf.exe gpu; exit 0
+
+  # building with MSYS2 the way a user would
+  windows-msys2:
     runs-on: windows-latest
     defaults:
       run:
@@ -46,23 +79,11 @@ jobs:
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
-          install: make mingw-w64-ucrt-x86_64-gcc
-      - name: Build (portable AVX2, static)
+          install: make mingw-w64-ucrt-x86_64-toolchain
+      - name: Build
         run: make portable
-      - name: Bundle runtime DLLs
-        run: ldd fastgguf.exe | grep -i ucrt64 | awk '{print $3}' | xargs -r -I{} cp {} .
       - name: Self-test
-        run: ./fastgguf.exe selftest
-      - uses: actions/upload-artifact@v4
-        with:
-          name: fastgguf-windows-x86_64
-          path: |
-            fastgguf.exe
-            fastgguf-server.exe
-            fastgguf-console.exe
-            *.dll
-            chat.bat
-            server.bat
+        run: PATH=/ucrt64/bin:$PATH ./fastgguf.exe selftest
 
   macos-arm64:
     runs-on: macos-14

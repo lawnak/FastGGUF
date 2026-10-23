@@ -9,7 +9,16 @@ ifeq ($(origin CC),default)
   CC = gcc
 endif
 ARCH    ?= -march=native
-CFLAGS  ?= -O3 $(ARCH) -fopenmp -Wall -Wno-unused-function
+# OpenMP (multi-threading) when the compiler has it; otherwise a single-threaded build
+ifeq ($(origin OMP),undefined)
+  ifneq ($(wildcard $(shell $(CC) -print-file-name=libgomp.a) $(shell $(CC) -print-file-name=libgomp.dll.a)),)
+    OMP = -fopenmp
+  else
+    $(warning OpenMP library not found for $(CC): building single-threaded)
+    OMP =
+  endif
+endif
+CFLAGS  ?= -O3 $(ARCH) $(OMP) -Wall -Wno-unused-function
 SRC      = fastgguf.c
 
 ifeq ($(OS),Windows_NT)
