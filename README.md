@@ -216,39 +216,44 @@ self-check against the CPU; if anything fails, fastgguf silently stays on the CP
 
 ### Measured: fastgguf vs llama.cpp on the same CPU
 
-Measured in a cloud VM: **Intel Xeon @ 2.1 GHz, 4 vCPUs (AVX-512 + VNNI), 15 GB RAM, no GPU.** Both engines read the *same* GGUF files, generate 128 tokens with 4 threads, and the mean of 3 runs is reported (fastgguf: `fastgguf chat … --temp 0 --max-tokens 128`; llama.cpp: `llama-bench -p 0 -n 128`). The files were made with `tools/synth_gguf.py`: exact layer sizes and weight types of the real models, random values (this VM could not download models). Raw data: [`docs/benchmark.json`](docs/benchmark.json).
+Measured in a cloud VM: **Intel Xeon @ 2.8 GHz, 4 vCPUs (AVX-512), 15 GB RAM, no GPU.** Both engines read the *same* GGUF files, generate 128 tokens with 4 threads, and the mean of 3 runs is reported (fastgguf: `fastgguf chat … --temp 0 --max-tokens 128`; llama.cpp: `llama-bench -p 0 -n 128`). The files were made with `tools/synth_gguf.py`: exact layer sizes and weight types of the real models, random values (this VM could not download models). Raw data: [`docs/benchmark.json`](docs/benchmark.json).
 
 ![Generation speed, fastgguf vs llama.cpp](docs/images/benchmark.svg)
 
 | Model | Weights | File | fastgguf tok/s | llama.cpp tok/s | fastgguf / llama.cpp |
 |---|---|---|---|---|---|
-| Qwen2.5 0.5B | Q4_0 | 0.28 GB | **43.0** | 128.1 | 34 % |
-| Qwen2.5 0.5B | Q8_0 | 0.53 GB | **33.5** | 68.3 | 49 % |
-| Qwen2.5 0.5B | Q4_K_M | 0.40 GB | **36.6** | 45.0 | 81 % |
-| Llama 3.2 1B | Q4_0 | 0.70 GB | **14.8** | 50.1 | 30 % |
-| Llama 3.2 1B | Q8_0 | 1.32 GB | **13.8** | 29.7 | 47 % |
-| Llama 3.2 1B | Q4_K_M | 0.80 GB | **10.2** | 24.3 | 42 % |
-| Gemma 3 1B | Q4_K_M | 0.81 GB | **17.9** | 25.4 | 71 % |
-| Qwen2.5 1.5B | Q4_K_M | 0.98 GB | **10.2** | 20.5 | 50 % |
-| Llama 3.2 3B | Q4_K_M | 2.01 GB | **5.1** | 11.2 | 45 % |
-| Qwen3 4B | Q4_K_M | 2.50 GB | **3.7** | 9.0 | 42 % |
-| Llama 3.1 8B | Q4_K_M | 4.92 GB | **2.3** | 4.7 | 49 % |
+| Qwen2.5 0.5B | Q4_0 | 0.28 GB | **43.0** | 69.2 | 62 % |
+| Qwen2.5 0.5B | Q8_0 | 0.53 GB | **33.5** | 39.7 | 84 % |
+| Qwen2.5 0.5B | Q4_K_M | 0.40 GB | **36.6** | 43.5 | 84 % |
+| Llama 3.2 1B | Q4_0 | 0.70 GB | **18.5** | 28.6 | 65 % |
+| Llama 3.2 1B | Q8_0 | 1.32 GB | **15.3** | 18.0 | 85 % |
+| Llama 3.2 1B | Q4_K_M | 0.80 GB | **19.9** | 27.6 | 72 % |
+| Gemma 3 1B | Q4_K_M | 0.81 GB | **18.1** | 24.6 | 73 % |
+| Qwen2.5 1.5B | Q4_K_M | 0.98 GB | **16.0** | 20.8 | 77 % |
+| Llama 3.2 3B | Q4_K_M | 2.01 GB | **7.6** | 10.9 | 70 % |
+| Qwen3 4B | Q4_K_M | 2.50 GB | **4.9** | 8.2 | 60 % |
+| Llama 3.1 8B | Q4_K_M | 4.92 GB | **3.5** | 4.9 | 72 % |
 
 **What the numbers say**
 
-- fastgguf runs at **roughly 30–80 % of llama.cpp's speed** on this CPU (most Q4_K_M / Q8_0 models 40–50 %,
-  Q4_0 30–34 %). Both scale the same way with threads (Llama 3.2 1B Q4_K_M):
+- fastgguf generates text at **roughly 60–85 % of llama.cpp's speed** on this CPU (Q4_K_M and Q8_0 files
+  60–85 %, Q4_0 62–65 %, where llama.cpp re-arranges the weights into a faster layout at load time).
+- On a single core the two are close; llama.cpp spreads more of each token's work across cores, so the
+  gap grows with more threads (Llama 3.2 1B Q4_K_M):
 
 | Threads | fastgguf tok/s | llama.cpp tok/s |
 |---|---|---|
-| 1 | 3.3 | 6.9 |
-| 2 | 6.1 | 12.7 |
-| 4 | 10.6 | 23.2 |
+| 1 | 7.1 | 8.2 |
+| 2 | 12.1 | 14.3 |
+| 4 | 17.2 | 24.8 |
 
-- Gemma 3 1B and Qwen2.5 0.5B store many Q4_K_M weights as Q5_0 (their layer widths are not multiples of
-  256). Since the Q5_0 / Q5_1 / Q4_1 integer kernels were added, these files run **4.5–5× faster** than
-  before (Qwen2.5 0.5B: 7.1 → 36.6 tok/s, Gemma 3 1B: 4.0 → 17.9 tok/s).
-- A 4-core, 2.1 GHz cloud VM is slow hardware; a recent desktop with more cores and faster memory should be several
+- Recent speed-ups: the K-quant kernels (Q4_K / Q5_K / Q6_K) now sum each 256-value block in integers
+  with one scale for the activations, like llama.cpp — about 1.2–1.7× faster generation for Q4_K_M files
+  (Llama 3.2 1B: 11.8 → 20 tok/s). Integer kernels for Q5_0 / Q5_1 / Q4_1 made Gemma 3 1B and
+  Qwen2.5 0.5B Q4_K_M files 4.5–5× faster (they store many weights as Q5_0).
+- **Reading long prompts is much slower than in llama.cpp** (about 7 vs 180 tokens/s for Llama 3.2 1B),
+  because fastgguf processes prompt tokens one by one instead of in batches.
+- A 4-core cloud VM is slow hardware; a recent desktop with more cores and faster memory should be several
   times faster (not measured here). Run `tools/bench.py` to get numbers for your own machine.
 - For reference, people read at roughly 5 tokens per second, so anything above that feels fluent.
 
@@ -406,7 +411,8 @@ real model's, because speed depends only on the sizes and weight types.
 
 - Prompts are processed one token at a time (no batched prompt processing), so very long
   prompts are slower than in llama.cpp.
-- CPU speed is currently below llama.cpp (see [Speed](#speed)); no ARM NEON kernels yet.
+- Generation is 15–40 % slower than llama.cpp on CPU (see [Speed](#speed)): attention, normalization
+  and activation rounding still run on one core. No ARM NEON kernels yet.
 - The server handles one request at a time.
 - Text only: no images/audio, no tool calling / JSON mode, no embeddings endpoint.
 - GGUF tokenizers are matched greedily (longest token first) instead of applying BPE merges,

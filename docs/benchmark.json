@@ -1,92 +1,90 @@
 {
-  "cpu": "Intel Xeon @ 2.10GHz (cloud VM, 4 vCPU, AVX-512/VNNI)",
+  "cpu": "Intel Xeon @ 2.80GHz (cloud VM, 4 vCPU, AVX-512)",
   "tokens": 128,
   "runs": 3,
   "rows": [
     {
       "model": "qwen2.5-0.5b-q4_0",
       "gb": 0.281,
-      "fastgguf": 42.99,
-      "llamacpp": 128.08
+      "fastgguf": 42.96,
+      "llamacpp": 69.15
     },
     {
       "model": "qwen2.5-0.5b-q8_0",
       "gb": 0.528,
-      "fastgguf": 33.48,
-      "llamacpp": 68.27
+      "fastgguf": 33.5,
+      "llamacpp": 39.69
     },
     {
       "model": "qwen2.5-0.5b-q4_k_m",
       "gb": 0.395,
-      "fastgguf": 36.64,
-      "llamacpp": 44.98,
-      "fastgguf_before_q5_0_kernel": 7.1
+      "fastgguf": 36.62,
+      "llamacpp": 43.5
     },
     {
       "model": "llama-3.2-1b-q4_0",
       "gb": 0.698,
-      "fastgguf": 14.84,
-      "llamacpp": 50.06
+      "fastgguf": 18.49,
+      "llamacpp": 28.64
     },
     {
       "model": "llama-3.2-1b-q8_0",
       "gb": 1.316,
-      "fastgguf": 13.82,
-      "llamacpp": 29.67
+      "fastgguf": 15.35,
+      "llamacpp": 17.99
     },
     {
       "model": "llama-3.2-1b-q4_k_m",
       "gb": 0.803,
-      "fastgguf": 10.21,
-      "llamacpp": 24.3
+      "fastgguf": 19.93,
+      "llamacpp": 27.58
     },
     {
       "model": "gemma-3-1b-q4_k_m",
       "gb": 0.806,
-      "fastgguf": 17.93,
-      "llamacpp": 25.36,
-      "fastgguf_before_q5_0_kernel": 3.96
+      "fastgguf": 18.07,
+      "llamacpp": 24.61
     },
     {
       "model": "qwen2.5-1.5b-q4_k_m",
       "gb": 0.983,
-      "fastgguf": 10.23,
-      "llamacpp": 20.54
+      "fastgguf": 16.0,
+      "llamacpp": 20.8
     },
     {
       "model": "llama-3.2-3b-q4_k_m",
       "gb": 2.014,
-      "fastgguf": 5.08,
-      "llamacpp": 11.21
+      "fastgguf": 7.57,
+      "llamacpp": 10.88
     },
     {
       "model": "qwen3-4b-q4_k_m",
       "gb": 2.495,
-      "fastgguf": 3.74,
-      "llamacpp": 8.96
+      "fastgguf": 4.94,
+      "llamacpp": 8.23
     },
     {
       "model": "llama-3.1-8b-q4_k_m",
       "gb": 4.916,
-      "fastgguf": 2.32,
-      "llamacpp": 4.72
+      "fastgguf": 3.51,
+      "llamacpp": 4.9
     }
   ],
   "threads": [
     {
       "threads": 1,
-      "fastgguf": 3.27,
-      "llamacpp": 6.94
+      "fastgguf": 7.06,
+      "llamacpp": 8.19
     },
     {
       "threads": 2,
-      "fastgguf": 6.12,
-      "llamacpp": 12.7
+      "fastgguf": 12.09,
+      "llamacpp": 14.26
     },
     {
       "threads": 4,
-      "fastgguf": 10.64,
-      "llamacpp": 23.21
+      "fastgguf": 17.21,
+      "llamacpp": 24.84
     }
   ]
 }
