@@ -710,6 +710,31 @@ static void quantize_q8(const float *x, q8_blk_t *out, int n) {
     }
 }
 
+// Q8_K activation block for K-quants: one scale per 256 values + sum of every 16 values
+typedef struct { float d; int8_t qs[256]; int16_t bsums[16]; } q8k_blk_t;
+
+static void quantize_q8k(const float *x, q8k_blk_t *out, int n) {
+    for (int b = 0; b < n / 256; b++) {
+        const float *xb = x + b * 256;
+        float amax = 0.0f;
+        for (int j = 0; j < 256; j++) {
+            float a = fabsf(xb[j]);
+            if (a > amax) amax = a;
+        }
+        float d = amax / 127.0f, id = d > 0.0f ? 1.0f / d : 0.0f;
+        out[b].d = d;
+        for (int g = 0; g < 16; g++) {
+            int s = 0;
+            for (int j = 0; j < 16; j++) {
+                int v = (int)lrintf(xb[16 * g + j] * id);
+                out[b].qs[16 * g + j] = (int8_t)v;
+                s += v;
+            }
+            out[b].bsums[g] = (int16_t)s;
+        }
+    }
+}
+
 #if defined(__AVX2__)
 // horizontal sum of a __m256 vector
 static inline float hsum_ps(__m256 v) {
@@ -963,139 +988,147 @@ static inline int hsum_i32(__m256i v) {
 #endif
 
 // -------------------------------------------------------------------------
-// K-quants against Q8-quantized x — each 32-element sub-block maps to exactly one Q8 block
-//   Q4_K/Q5_K: element = d*sc*q - dmin*m  →  Σ = d*sc*Σ(q·y) - dmin*m*Σy
-//   Q6_K:      element = d*sc*(q-32), sc per 16 elements  →  Σ = d*sc*(Σ(q·y) - 32*Σy)
-// q is unsigned (≤ 63) so it feeds maddubs directly without the sign trick; Σy is precomputed in s16
+// K-quants (Q4_K / Q5_K / Q6_K) against Q8_K-quantized x: one float scale per 256 elements
+// (like llama.cpp), so a whole 256 block is summed in integers and converted to float once.
+//   Q4_K/Q5_K: element = d*sc*q - dmin*m  →  Σ = d*yd*Σ_s sc_s·Σ(q·y) - dmin*yd*Σ_s m_s·Σy
+//   Q6_K:      element = d*sc*(q-32), sc per 16  →  Σ = d*yd*(Σ_g sc_g·Σ(q·y) - 32·Σ_g sc_g·Σy)
+// Σy per 16 elements is precomputed in bsums. q is unsigned (≤ 63) so it feeds maddubs directly.
 // nb = number of 256-element blocks
 // -------------------------------------------------------------------------
 
-static float dot_q4_K_q8(const uint8_t *row, const q8_blk_t *xq, int nb) {
-#if defined(__AVX2__)
-    const __m256i m4 = _mm256_set1_epi8(0x0F);
-    const __m256i ones = _mm256_set1_epi16(1);
-    __m256 acc = _mm256_setzero_ps();
-    float mins = 0.0f;
-    for (int b = 0; b < nb; b++) {
-        const uint8_t *p = row + b * 144;
-        float d = FP16(rd_u16(p)), dmin = FP16(rd_u16(p + 2));
-        const uint8_t *sc = p + 4, *qs = p + 16;
-        const q8_blk_t *y = xq + b * 8;
-        for (int j = 0; j < 4; j++) {
-            uint8_t s1, m1, s2, m2;
-            scale_min_k4(2 * j, sc, &s1, &m1);
-            scale_min_k4(2 * j + 1, sc, &s2, &m2);
-            const q8_blk_t *y1 = &y[2 * j], *y2 = &y[2 * j + 1];
-            __m256i q  = _mm256_loadu_si256((const __m256i *)(qs + 32 * j));
-            __m256i lo = _mm256_and_si256(q, m4);
-            __m256i hi = _mm256_and_si256(_mm256_srli_epi16(q, 4), m4);
-            __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(lo, _mm256_loadu_si256((const __m256i *)y1->qs)), ones);
-            __m256i p2 = _mm256_madd_epi16(_mm256_maddubs_epi16(hi, _mm256_loadu_si256((const __m256i *)y2->qs)), ones);
-            acc = _mm256_fmadd_ps(_mm256_set1_ps(d * s1 * y1->d), _mm256_cvtepi32_ps(p1), acc);
-            acc = _mm256_fmadd_ps(_mm256_set1_ps(d * s2 * y2->d), _mm256_cvtepi32_ps(p2), acc);
-            mins += dmin * (m1 * y1->d * (y1->s16[0] + y1->s16[1]) + m2 * y2->d * (y2->s16[0] + y2->s16[1]));
-        }
-    }
-    return hsum_ps(acc) - mins;
-#else
-    float sum = 0.0f;
-    for (int b = 0; b < nb; b++) {
-        const uint8_t *p = row + b * 144;
-        float d = FP16(rd_u16(p)), dmin = FP16(rd_u16(p + 2));
-        const uint8_t *sc = p + 4, *qs = p + 16;
-        const q8_blk_t *y = xq + b * 8;
-        for (int j = 0; j < 4; j++) {
-            uint8_t s1, m1, s2, m2;
-            scale_min_k4(2 * j, sc, &s1, &m1);
-            scale_min_k4(2 * j + 1, sc, &s2, &m2);
-            const q8_blk_t *y1 = &y[2 * j], *y2 = &y[2 * j + 1];
-            const uint8_t *q = qs + 32 * j;
-            int i1 = 0, i2 = 0;
-            for (int l = 0; l < 32; l++) {
-                i1 += (q[l] & 0xF) * y1->qs[l];
-                i2 += (q[l] >> 4)  * y2->qs[l];
-            }
-            sum += y1->d * (d * s1 * i1 - dmin * m1 * (y1->s16[0] + y1->s16[1]));
-            sum += y2->d * (d * s2 * i2 - dmin * m2 * (y2->s16[0] + y2->s16[1]));
-        }
-    }
-    return sum;
-#endif
+// the 12 packed scale bytes of Q4_K/Q5_K → out[0..7] = six-bit scales, out[8..15] = six-bit mins
+static inline void unpack_scales_k4(const uint8_t *s12, uint8_t out[16]) {
+    uint32_t u[4];
+    memcpy(u, s12, 12);
+    const uint32_t k1 = 0x3f3f3f3f, k2 = 0x0f0f0f0f, k3 = 0x03030303;
+    u[3] = ((u[2] >> 4) & k2) | (((u[1] >> 6) & k3) << 4);
+    uint32_t aux = u[1] & k1;
+    u[1] = (u[2] & k2) | (((u[0] >> 6) & k3) << 4);
+    u[2] = aux;
+    u[0] &= k1;
+    memcpy(out, u, 16);
 }
 
-static float dot_q5_K_q8(const uint8_t *row, const q8_blk_t *xq, int nb) {
+// Σ_s m_s · (Σy over the 32 elements of sub-block s)
+static inline int k4_min_sum(const uint8_t sm[16], const q8k_blk_t *y) {
+    int s = 0;
+    for (int j = 0; j < 8; j++) s += sm[8 + j] * (y->bsums[2 * j] + y->bsums[2 * j + 1]);
+    return s;
+}
+
+static float dot_q4_K_q8k(const uint8_t *row, const q8k_blk_t *y, int nb) {
+    float sum = 0.0f;
 #if defined(__AVX2__)
     const __m256i m4 = _mm256_set1_epi8(0x0F);
-    const __m256i one8 = _mm256_set1_epi8(1);
-    const __m256i ones = _mm256_set1_epi16(1);
     __m256 acc = _mm256_setzero_ps();
-    float mins = 0.0f;
+#endif
     for (int b = 0; b < nb; b++) {
-        const uint8_t *p = row + b * 176;
-        float d = FP16(rd_u16(p)), dmin = FP16(rd_u16(p + 2));
-        const uint8_t *sc = p + 4, *ql = p + 48;
-        const q8_blk_t *y = xq + b * 8;
-        // 5th bit: sub-block s takes bit s of every byte in qh — shift by 2 per pair
-        __m256i hb = _mm256_loadu_si256((const __m256i *)(p + 16));
+        const uint8_t *p = row + b * 144, *qs = p + 16;
+        const int8_t *q8 = y[b].qs;
+        uint8_t sm[16];
+        unpack_scales_k4(p + 4, sm);
+        float yd = y[b].d;
+#if defined(__AVX2__)
+        __m256i sumi = _mm256_setzero_si256();
+        for (int j = 0; j < 4; j++) {     // 64 elements: low nibbles = sub-block 2j, high = 2j+1
+            __m256i q4 = _mm256_loadu_si256((const __m256i *)(qs + 32 * j));
+            __m256i lo = _mm256_and_si256(q4, m4);
+            __m256i hi = _mm256_and_si256(_mm256_srli_epi16(q4, 4), m4);
+            __m256i pl = _mm256_maddubs_epi16(lo, _mm256_loadu_si256((const __m256i *)(q8 + 64 * j)));
+            __m256i ph = _mm256_maddubs_epi16(hi, _mm256_loadu_si256((const __m256i *)(q8 + 64 * j + 32)));
+            pl = _mm256_madd_epi16(pl, _mm256_set1_epi16(sm[2 * j]));
+            ph = _mm256_madd_epi16(ph, _mm256_set1_epi16(sm[2 * j + 1]));
+            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(pl, ph));
+        }
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(FP16(rd_u16(p)) * yd), _mm256_cvtepi32_ps(sumi), acc);
+#else
+        int sumi = 0;
         for (int j = 0; j < 4; j++) {
-            uint8_t s1, m1, s2, m2;
-            scale_min_k4(2 * j, sc, &s1, &m1);
-            scale_min_k4(2 * j + 1, sc, &s2, &m2);
-            const q8_blk_t *y1 = &y[2 * j], *y2 = &y[2 * j + 1];
-            __m256i q  = _mm256_loadu_si256((const __m256i *)(ql + 32 * j));
+            int i1 = 0, i2 = 0;
+            for (int l = 0; l < 32; l++) {
+                i1 += (qs[32 * j + l] & 0xF) * q8[64 * j + l];
+                i2 += (qs[32 * j + l] >> 4)  * q8[64 * j + 32 + l];
+            }
+            sumi += sm[2 * j] * i1 + sm[2 * j + 1] * i2;
+        }
+        sum += FP16(rd_u16(p)) * yd * (float)sumi;
+#endif
+        sum -= FP16(rd_u16(p + 2)) * yd * (float)k4_min_sum(sm, &y[b]);
+    }
+#if defined(__AVX2__)
+    sum += hsum_ps(acc);
+#endif
+    return sum;
+}
+
+static float dot_q5_K_q8k(const uint8_t *row, const q8k_blk_t *y, int nb) {
+    float sum = 0.0f;
+#if defined(__AVX2__)
+    const __m256i m4 = _mm256_set1_epi8(0x0F), one8 = _mm256_set1_epi8(1);
+    __m256 acc = _mm256_setzero_ps();
+#endif
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *p = row + b * 176, *qh = p + 16, *ql = p + 48;
+        const int8_t *q8 = y[b].qs;
+        uint8_t sm[16];
+        unpack_scales_k4(p + 4, sm);
+        float yd = y[b].d;
+#if defined(__AVX2__)
+        // 5th bit: sub-block s takes bit s of every qh byte — shift by 2 per pair
+        __m256i hb = _mm256_loadu_si256((const __m256i *)qh);
+        __m256i sumi = _mm256_setzero_si256();
+        for (int j = 0; j < 4; j++) {
+            __m256i q = _mm256_loadu_si256((const __m256i *)(ql + 32 * j));
             __m256i lo = _mm256_or_si256(_mm256_and_si256(q, m4),
                                          _mm256_slli_epi16(_mm256_and_si256(hb, one8), 4));
             __m256i hi = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q, 4), m4),
                                          _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(hb, 1), one8), 4));
             hb = _mm256_srli_epi16(hb, 2);
-            __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(lo, _mm256_loadu_si256((const __m256i *)y1->qs)), ones);
-            __m256i p2 = _mm256_madd_epi16(_mm256_maddubs_epi16(hi, _mm256_loadu_si256((const __m256i *)y2->qs)), ones);
-            acc = _mm256_fmadd_ps(_mm256_set1_ps(d * s1 * y1->d), _mm256_cvtepi32_ps(p1), acc);
-            acc = _mm256_fmadd_ps(_mm256_set1_ps(d * s2 * y2->d), _mm256_cvtepi32_ps(p2), acc);
-            mins += dmin * (m1 * y1->d * (y1->s16[0] + y1->s16[1]) + m2 * y2->d * (y2->s16[0] + y2->s16[1]));
+            __m256i pl = _mm256_maddubs_epi16(lo, _mm256_loadu_si256((const __m256i *)(q8 + 64 * j)));
+            __m256i ph = _mm256_maddubs_epi16(hi, _mm256_loadu_si256((const __m256i *)(q8 + 64 * j + 32)));
+            pl = _mm256_madd_epi16(pl, _mm256_set1_epi16(sm[2 * j]));
+            ph = _mm256_madd_epi16(ph, _mm256_set1_epi16(sm[2 * j + 1]));
+            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(pl, ph));
         }
-    }
-    return hsum_ps(acc) - mins;
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(FP16(rd_u16(p)) * yd), _mm256_cvtepi32_ps(sumi), acc);
 #else
-    float sum = 0.0f;
-    for (int b = 0; b < nb; b++) {
-        const uint8_t *p = row + b * 176;
-        float d = FP16(rd_u16(p)), dmin = FP16(rd_u16(p + 2));
-        const uint8_t *sc = p + 4, *qh = p + 16, *ql = p + 48;
-        const q8_blk_t *y = xq + b * 8;
+        int sumi = 0;
         for (int j = 0; j < 4; j++) {
-            uint8_t s1, m1, s2, m2;
-            scale_min_k4(2 * j, sc, &s1, &m1);
-            scale_min_k4(2 * j + 1, sc, &s2, &m2);
-            const q8_blk_t *y1 = &y[2 * j], *y2 = &y[2 * j + 1];
-            const uint8_t *q = ql + 32 * j;
             int i1 = 0, i2 = 0;
             for (int l = 0; l < 32; l++) {
                 int h = qh[l] >> (2 * j);
-                i1 += ((q[l] & 0xF) | ((h & 1) << 4)) * y1->qs[l];
-                i2 += ((q[l] >> 4)  | ((h & 2) << 3)) * y2->qs[l];
+                i1 += ((ql[32 * j + l] & 0xF) | ((h & 1) << 4)) * q8[64 * j + l];
+                i2 += ((ql[32 * j + l] >> 4)  | ((h & 2) << 3)) * q8[64 * j + 32 + l];
             }
-            sum += y1->d * (d * s1 * i1 - dmin * m1 * (y1->s16[0] + y1->s16[1]));
-            sum += y2->d * (d * s2 * i2 - dmin * m2 * (y2->s16[0] + y2->s16[1]));
+            sumi += sm[2 * j] * i1 + sm[2 * j + 1] * i2;
         }
-    }
-    return sum;
+        sum += FP16(rd_u16(p)) * yd * (float)sumi;
 #endif
+        sum -= FP16(rd_u16(p + 2)) * yd * (float)k4_min_sum(sm, &y[b]);
+    }
+#if defined(__AVX2__)
+    sum += hsum_ps(acc);
+#endif
+    return sum;
 }
 
-static float dot_q6_K_q8(const uint8_t *row, const q8_blk_t *xq, int nb) {
+static float dot_q6_K_q8k(const uint8_t *row, const q8k_blk_t *y, int nb) {
+    float sum = 0.0f;
 #if defined(__AVX2__)
     const __m256i m4 = _mm256_set1_epi8(0x0F), m3 = _mm256_set1_epi8(3);
     __m256 acc = _mm256_setzero_ps();
-    float corr = 0.0f;
+#endif
     for (int b = 0; b < nb; b++) {
         const uint8_t *p = row + b * 210;
         const int8_t *sc = (const int8_t *)(p + 192);
-        float d = FP16(rd_u16(p + 208));
+        float dd = FP16(rd_u16(p + 208)) * y[b].d;
+        int corr = 0;                      // Σ_g sc_g · Σy_g  (the -32 offset)
+        for (int g = 0; g < 16; g++) corr += sc[g] * y[b].bsums[g];
+#if defined(__AVX2__)
+        __m256i sumi = _mm256_setzero_si256();
         for (int half = 0; half < 2; half++) {
             const uint8_t *ql = p + half * 64, *qh = p + 128 + half * 32;
-            const int8_t *s = sc + half * 8;
-            const q8_blk_t *y = xq + b * 8 + half * 4;
+            const int8_t *s = sc + half * 8, *q8 = y[b].qs + half * 128;
             __m256i a0 = _mm256_loadu_si256((const __m256i *)ql);
             __m256i a1 = _mm256_loadu_si256((const __m256i *)(ql + 32));
             __m256i hh = _mm256_loadu_si256((const __m256i *)qh);
@@ -1112,40 +1145,35 @@ static float dot_q6_K_q8(const uint8_t *row, const q8_blk_t *xq, int nb) {
                 // scale per 16 elements: low half of the register uses s[2k], high half s[2k+1]
                 __m256i sv = _mm256_insertf128_si256(_mm256_castsi128_si256(_mm_set1_epi16(s[2 * k])),
                                                      _mm_set1_epi16(s[2 * k + 1]), 1);
-                __m256i dt = _mm256_maddubs_epi16(q[k], _mm256_loadu_si256((const __m256i *)y[k].qs));
-                float f = d * y[k].d;
-                acc = _mm256_fmadd_ps(_mm256_set1_ps(f), _mm256_cvtepi32_ps(_mm256_madd_epi16(dt, sv)), acc);
-                corr += f * 32.0f * (float)(s[2 * k] * y[k].s16[0] + s[2 * k + 1] * y[k].s16[1]);
+                __m256i dt = _mm256_maddubs_epi16(q[k], _mm256_loadu_si256((const __m256i *)(q8 + 32 * k)));
+                sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(dt, sv));
             }
         }
-    }
-    return hsum_ps(acc) - corr;
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(dd), _mm256_cvtepi32_ps(sumi), acc);
+        sum -= dd * 32.0f * (float)corr;
 #else
-    float sum = 0.0f;
-    for (int b = 0; b < nb; b++) {
-        const uint8_t *p = row + b * 210;
-        const int8_t *sc = (const int8_t *)(p + 192);
-        float d = FP16(rd_u16(p + 208));
+        int sumi = 0;
         for (int half = 0; half < 2; half++) {
             const uint8_t *ql = p + half * 64, *qh = p + 128 + half * 32;
-            const int8_t *s = sc + half * 8;
-            const q8_blk_t *y = xq + b * 8 + half * 4;
+            const int8_t *s = sc + half * 8, *q8 = y[b].qs + half * 128;
             for (int k = 0; k < 4; k++) {
                 // k: 0/1 low nibble of ql[l]/ql[l+32], 2/3 high nibble — and the qh bits at 2k
                 const uint8_t *lq = ql + (k & 1) * 32;
-                int lsh = (k >> 1) * 4, hsh = 2 * k;
-                int i0 = 0, i1 = 0;
+                int lsh = (k >> 1) * 4, hsh = 2 * k, i0 = 0, i1 = 0;
                 for (int l = 0; l < 32; l++) {
                     int q = ((lq[l] >> lsh) & 0xF) | (((qh[l] >> hsh) & 3) << 4);
-                    int v = (q - 32) * y[k].qs[l];
-                    if (l < 16) i0 += v; else i1 += v;
+                    if (l < 16) i0 += q * q8[32 * k + l]; else i1 += q * q8[32 * k + l];
                 }
-                sum += d * y[k].d * (float)(s[2 * k] * i0 + s[2 * k + 1] * i1);
+                sumi += s[2 * k] * i0 + s[2 * k + 1] * i1;
             }
         }
-    }
-    return sum;
+        sum += dd * (float)(sumi - 32 * corr);
 #endif
+    }
+#if defined(__AVX2__)
+    sum += hsum_ps(acc);
+#endif
+    return sum;
 }
 
 // dot(Q2_K row, Q8-quantized x) — value d*(s&0xF)*q - dmin*(s>>4) per 16 elements:
@@ -1833,7 +1861,8 @@ static int cmd_gpuinfo(void) {
 // =========================================================================
 
 static float **g_scratch;      // [thread][max_cols] for dequantizing K-quants
-static q8_blk_t *g_xq8;        // shared buffer for the quantized x
+static q8_blk_t *g_xq8;        // shared buffer for the quantized x (32-element blocks)
+static q8k_blk_t *g_xq8k;      // the same x as 256-element blocks, for K-quants
 static int g_max_cols;
 
 static void matvec_init_scratch(int max_cols) {
@@ -1843,27 +1872,46 @@ static void matvec_init_scratch(int max_cols) {
         for (int i = 0; i < nt; i++) free(g_scratch[i]);
         free(g_scratch);
         free(g_xq8);
+        free(g_xq8k);
     }
     g_max_cols = max_cols;
     g_scratch = (float **)malloc(nt * sizeof(float *));
     for (int i = 0; i < nt; i++) g_scratch[i] = (float *)malloc((size_t)max_cols * sizeof(float));
     g_xq8 = (q8_blk_t *)malloc(((size_t)max_cols / 32 + 1) * sizeof(q8_blk_t));
+    g_xq8k = (q8k_blk_t *)malloc(((size_t)max_cols / 256 + 1) * sizeof(q8k_blk_t));
 }
 
-// does this type have an integer kernel that works on Q8-quantized x?
+// how x must be prepared for this weight type: ACT_Q8K (256-element blocks, K-quants),
+// ACT_Q8 (32-element blocks) or ACT_F32 (no integer kernel: generic float path)
+enum { ACT_F32 = 0, ACT_Q8 = 1, ACT_Q8K = 2 };
 static int type_uses_q8(uint32_t type, int cols) {
-    return ((type == T_Q4_0 || type == T_Q8_0 || type == T_IQ4_NL || type == T_Q4_1 ||
-             type == T_Q5_0 || type == T_Q5_1) && (cols % 32 == 0)) ||
-           ((type == T_Q2_K || type == T_Q3_K || type == T_Q4_K || type == T_Q5_K ||
-             type == T_Q6_K || type == T_IQ4_XS) && (cols % 256 == 0));
+    if ((type == T_Q4_K || type == T_Q5_K || type == T_Q6_K) && cols % 256 == 0) return ACT_Q8K;
+    if ((type == T_Q4_0 || type == T_Q8_0 || type == T_IQ4_NL || type == T_Q4_1 ||
+         type == T_Q5_0 || type == T_Q5_1) && cols % 32 == 0) return ACT_Q8;
+    if ((type == T_Q2_K || type == T_Q3_K || type == T_IQ4_XS) && cols % 256 == 0) return ACT_Q8;
+    return ACT_F32;
 }
 
-// one row: dot(W[r], x) — xq is x pre-quantized (read only when use_q8)
+// quantize x for the given kind into the matching buffer
+static void quantize_act(int kind, const float *x, q8_blk_t *xq, q8k_blk_t *xk, int n) {
+    if (kind == ACT_Q8) quantize_q8(x, xq, n);
+    else if (kind == ACT_Q8K) quantize_q8k(x, xk, n);
+}
+
+// one row: dot(W[r], x) — kind (ACT_*) says which pre-quantized copy of x to use: xq or xk
 // unsupported type: returns 0 and sets *fail
-static inline float dot_row(uint32_t type, int use_q8, const uint8_t *rb,
-                            const q8_blk_t *xq, const float *x, int cols, int *fail) {
+static inline float dot_row(uint32_t type, int kind, const uint8_t *rb, const q8_blk_t *xq,
+                            const q8k_blk_t *xk, const float *x, int cols, int *fail) {
     int nb32 = cols / 32, nb256 = cols / 256;
-    switch (use_q8 ? type : 0xFFFF) {
+    if (kind == ACT_Q8K) {
+        switch (type) {
+        case T_Q4_K: return dot_q4_K_q8k(rb, xk, nb256);
+        case T_Q5_K: return dot_q5_K_q8k(rb, xk, nb256);
+        case T_Q6_K: return dot_q6_K_q8k(rb, xk, nb256);
+        default: break;
+        }
+    }
+    switch (kind == ACT_Q8 ? type : 0xFFFF) {
     case T_Q4_0: return dot_q4_0_q8(rb, xq, nb32);
     case T_Q8_0: return dot_q8_0_q8(rb, xq, nb32);
     case T_Q4_1: return dot_q4_1_q8(rb, xq, nb32);
@@ -1871,9 +1919,6 @@ static inline float dot_row(uint32_t type, int use_q8, const uint8_t *rb,
     case T_Q5_1: return dot_q5_1_q8(rb, xq, nb32);
     case T_Q2_K: return dot_q2_K_q8(rb, xq, nb256);
     case T_Q3_K: return dot_q3_K_q8(rb, xq, nb256);
-    case T_Q4_K: return dot_q4_K_q8(rb, xq, nb256);
-    case T_Q5_K: return dot_q5_K_q8(rb, xq, nb256);
-    case T_Q6_K: return dot_q6_K_q8(rb, xq, nb256);
     case T_IQ4_NL: return dot_iq4_nl_q8(rb, xq, nb32);
     case T_IQ4_XS: return dot_iq4_xs_q8(rb, xq, nb256);
     default: break;
@@ -1908,13 +1953,13 @@ static int matvec(tensor_t *t, const float *x, float *out) {
     const uint8_t *raw = t->data;
 
     int use_q8 = type_uses_q8(t->type, cols);
-    if (use_q8) quantize_q8(x, g_xq8, cols);
+    quantize_act(use_q8, x, g_xq8, g_xq8k, cols);
     int nb32 = cols / 32;
 
     int fail = 0;
 
     // special path: Q4_0 two rows at a time
-    if (use_q8 && t->type == T_Q4_0) {
+    if (use_q8 == ACT_Q8 && t->type == T_Q4_0) {
         int64_t pairs = rows / 2;
         #pragma omp parallel for schedule(static)
         for (int64_t pr = 0; pr < pairs; pr++) {
@@ -1928,7 +1973,7 @@ static int matvec(tensor_t *t, const float *x, float *out) {
 
     #pragma omp parallel for schedule(static)
     for (int64_t r = 0; r < rows; r++)
-        out[r] = dot_row(t->type, use_q8, raw + (uint64_t)r * stride, g_xq8, x, cols, &fail);
+        out[r] = dot_row(t->type, use_q8, raw + (uint64_t)r * stride, g_xq8, g_xq8k, x, cols, &fail);
     if (fail) {
         fprintf(stderr, "matvec: unsupported type %s in %s\n", type_name(t->type), t->name);
         return -1;
@@ -2798,6 +2843,7 @@ typedef struct {
     float *moe_probs, *moe_w, *moe_h;  // router probabilities, weights of the selected experts, SiLU(gate)·up per expert
     int *moe_sel;                      // indices of the selected experts (n_expert_used)
     q8_blk_t *moe_xq;                  // down input quantized for every selected expert
+    q8k_blk_t *moe_xk;                 // the same, as 256-element blocks (K-quant experts)
     cand_t *cand;   // sampling workspace (n_vocab)
 } model_t;
 
@@ -3141,6 +3187,7 @@ static int model_load(model_t *m, gguf_t *g, int n_ctx) {
         m->moe_sel   = (int *)malloc((size_t)k * sizeof(int));
         m->moe_h     = (float *)malloc((size_t)k * (m->ff_exp > 0 ? m->ff_exp : 1) * sizeof(float));
         m->moe_xq    = (q8_blk_t *)malloc(((size_t)k * (m->ff_exp / 32) + 1) * sizeof(q8_blk_t));
+        m->moe_xk    = (q8k_blk_t *)malloc(((size_t)k * (m->ff_exp / 256) + 1) * sizeof(q8k_blk_t));
     }
     if (m->n_ple > 0) {
         m->ple_in = (float *)malloc((size_t)m->n_ple * m->n_layer * sizeof(float));
@@ -3243,26 +3290,28 @@ static int moe_ffn(model_t *m, layer_t *L, const float *x, float *out) {
     tensor_t *tg = L->ffn_gate_exps, *tu = L->ffn_up_exps, *td = L->ffn_down_exps;
     uint64_t sg = row_stride(tg->type, (uint64_t)n_embd), su = row_stride(tu->type, (uint64_t)n_embd);
     int qg = type_uses_q8(tg->type, n_embd), qu = type_uses_q8(tu->type, n_embd);
-    if (qg || qu) quantize_q8(x, g_xq8, n_embd);
+    quantize_act(qg, x, g_xq8, g_xq8k, n_embd);
+    if (qu != qg) quantize_act(qu, x, g_xq8, g_xq8k, n_embd);
     int fail = 0;
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < k * ff; r++) {
         uint64_t row = (uint64_t)sel[r / ff] * ff + r % ff;
-        float gv = dot_row(tg->type, qg, tg->data + row * sg, g_xq8, x, n_embd, &fail);
-        float uv = dot_row(tu->type, qu, tu->data + row * su, g_xq8, x, n_embd, &fail);
+        float gv = dot_row(tg->type, qg, tg->data + row * sg, g_xq8, g_xq8k, x, n_embd, &fail);
+        float uv = dot_row(tu->type, qu, tu->data + row * su, g_xq8, g_xq8k, x, n_embd, &fail);
         h[r] = silu_f(gv) * uv;
     }
 
     // down: different input per expert — each output row sums k weighted experts
     uint64_t sd = row_stride(td->type, (uint64_t)ff);
-    int qd = type_uses_q8(td->type, ff), nbd = ff / 32;
-    if (qd) for (int j = 0; j < k; j++) quantize_q8(h + j * ff, m->moe_xq + j * nbd, ff);
+    int qd = type_uses_q8(td->type, ff), nbd = ff / 32, nbk = ff / 256;
+    for (int j = 0; j < k; j++)
+        quantize_act(qd, h + j * ff, m->moe_xq + j * nbd, m->moe_xk + j * nbk, ff);
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < n_embd; i++) {
         float s = 0.0f;
         for (int j = 0; j < k; j++) {
             uint64_t row = (uint64_t)sel[j] * n_embd + i;
-            s += w[j] * dot_row(td->type, qd, td->data + row * sd, m->moe_xq + j * nbd,
+            s += w[j] * dot_row(td->type, qd, td->data + row * sd, m->moe_xq + j * nbd, m->moe_xk + j * nbk,
                                 h + j * ff, ff, &fail);
         }
         out[i] = s;
@@ -3752,7 +3801,7 @@ static int cmd_dump(const char *path) {
 // K-quant kernel against an independent float reference: dequantized row · dequantized quantized x
 // the error is measured relative to Σ|term|, not the sum, because the min term can cancel most of the value
 static int test_kquant(const char *name, uint32_t type, int blk_bytes,
-                       float (*dot)(const uint8_t *, const q8_blk_t *, int)) {
+                       float (*dot)(const uint8_t *, const q8k_blk_t *, int)) {
     int n = 1024, nb = n / 256;
     uint8_t *row = (uint8_t *)malloc((size_t)nb * blk_bytes);
     for (int i = 0; i < nb * blk_bytes; i++) row[i] = (uint8_t)(rand() & 0xFF);
@@ -3765,23 +3814,23 @@ static int test_kquant(const char *name, uint32_t type, int blk_bytes,
     }
     float *x = (float *)malloc(n * sizeof(float));
     for (int i = 0; i < n; i++) x[i] = (float)(rand() % 2000 - 1000) / 500.0f;
-    q8_blk_t *xq = (q8_blk_t *)malloc((n / 32) * sizeof(q8_blk_t));
-    quantize_q8(x, xq, n);
+    q8k_blk_t *xk = (q8k_blk_t *)malloc((n / 256) * sizeof(q8k_blk_t));
+    quantize_q8k(x, xk, n);
 
-    float fast = dot(row, xq, nb);
+    float fast = dot(row, xk, nb);
 
     float *dq = (float *)malloc(n * sizeof(float));
     dequantize_row(type, row, dq, n);
     double ref = 0.0, mag = 0.0;
     for (int i = 0; i < n; i++) {
-        double t = (double)dq[i] * (double)(xq[i / 32].d * (float)xq[i / 32].qs[i % 32]);
+        double t = (double)dq[i] * (double)(xk[i / 256].d * (float)xk[i / 256].qs[i % 256]);
         ref += t;
         mag += fabs(t);
     }
     double rel = fabs((double)fast - ref) / (mag + 1e-9);
     printf("%-5s fast=%.6f float_ref=%.6f rel_err=%.2e %s\n", name, fast, ref, rel,
            rel < 1e-4 ? "OK" : "FAIL");
-    free(row); free(x); free(xq); free(dq);
+    free(row); free(x); free(xk); free(dq);
     return rel < 1e-4 ? 0 : 1;
 }
 
@@ -4057,9 +4106,9 @@ static int cmd_selftest(void) {
     }
 
     // --- Q4_K / Q5_K / Q6_K: independent reference, error relative to Σ|term| ---
-    fails += test_kquant("Q4_K", T_Q4_K, 144, dot_q4_K_q8);
-    fails += test_kquant("Q5_K", T_Q5_K, 176, dot_q5_K_q8);
-    fails += test_kquant("Q6_K", T_Q6_K, 210, dot_q6_K_q8);
+    fails += test_kquant("Q4_K", T_Q4_K, 144, dot_q4_K_q8k);
+    fails += test_kquant("Q5_K", T_Q5_K, 176, dot_q5_K_q8k);
+    fails += test_kquant("Q6_K", T_Q6_K, 210, dot_q6_K_q8k);
 
     // --- sampler ---
     fails += test_sampler();
@@ -4092,6 +4141,7 @@ static int cmd_selftest(void) {
         mm->moe_sel = (int *)malloc(NK * sizeof(int));
         mm->moe_h = (float *)malloc(NK * F * sizeof(float));
         mm->moe_xq = (q8_blk_t *)malloc((NK * F / 32 + 1) * sizeof(q8_blk_t));
+        mm->moe_xk = (q8k_blk_t *)malloc((NK * F / 256 + 1) * sizeof(q8k_blk_t));
 
         static float router[NE * D], x[D], out[D], ref[D];
         for (int i = 0; i < NE * D; i++) router[i] = (float)(rand() % 2000 - 1000) / 2000.0f;
@@ -4160,7 +4210,7 @@ static int cmd_selftest(void) {
                sel[0], sel[1], sel[2], rel, ok ? "OK" : "FAIL");
         fails += !ok;
         for (int t = 0; t < 3; t++) { free(qe[t]); free(fe[t]); }
-        free(mm->moe_probs); free(mm->moe_w); free(mm->moe_sel); free(mm->moe_h); free(mm->moe_xq);
+        free(mm->moe_probs); free(mm->moe_w); free(mm->moe_sel); free(mm->moe_h); free(mm->moe_xq); free(mm->moe_xk);
         free(mm);
     }
 
