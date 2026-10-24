@@ -54,8 +54,9 @@ NVIDIA, AMD or Intel graphics card through OpenCL when one is present.
 
 ### 1. Get the program
 
-**Windows** — download `fastgguf-windows-x86_64` from the latest successful run on the
-[Actions page](../../actions/workflows/build.yml) (Artifacts section), or build it yourself:
+**Windows** — download **`fastgguf-…-windows-x64.zip`** from the
+[**Releases page**](../../releases/latest), unzip it, done (no installation; use the `-compat` zip only
+on very old CPUs without AVX2). Or build it yourself:
 
 ```bat
 build.bat
@@ -381,7 +382,8 @@ By hand: `gcc -O3 -march=native -fopenmp -o fastgguf fastgguf.c -lm -ldl`
 compiler has no OpenMP library.
 
 Every push is built and tested on Linux, Windows and macOS by
-[GitHub Actions](.github/workflows/build.yml).
+[GitHub Actions](.github/workflows/build.yml). Pushing a tag such as `v0.2.0` builds, tests and publishes a
+[release](.github/workflows/release.yml) with ready-to-run Windows and Linux binaries.
 
 ### Benchmark your own machine
 

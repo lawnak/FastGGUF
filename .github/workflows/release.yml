@@ -1,0 +1,126 @@
+name: release
+
+# Push a tag like v0.1.0 to build, test and publish a GitHub Release.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mingw-w64
+        run: sudo apt-get update -q && sudo apt-get install -y -q gcc-mingw-w64-x86-64 zip
+
+      - name: Windows x64 (AVX2, recommended)
+        run: |
+          make portable OS=Windows_NT CC=x86_64-w64-mingw32-gcc
+          mkdir -p dist/win && mv *.exe dist/win/
+      - name: Windows x64 compat (any 64-bit CPU, slower)
+        run: |
+          make -B OS=Windows_NT CC=x86_64-w64-mingw32-gcc ARCH="-march=x86-64"
+          mkdir -p dist/win-compat && mv *.exe dist/win-compat/
+      - name: Linux x64 (AVX2)
+        run: |
+          make portable
+          mkdir -p dist/linux && mv fastgguf fastgguf-server fastgguf-console dist/linux/
+          ./dist/linux/fastgguf selftest
+
+      - name: Package
+        run: |
+          cat > dist/README.txt <<'EOF'
+          fastgguf - run GGUF language models locally
+
+          Windows:
+            1. Download a .gguf model (for example Qwen2.5 1.5B Instruct Q4_K_M from Hugging Face).
+            2. Drag the .gguf file onto chat.bat   -> chat in a terminal window
+               or drag it onto server.bat          -> web chat opens at http://localhost:8080
+            3. Optional check:  fastgguf.exe selftest
+
+          Commands:
+            fastgguf chat    model.gguf [ctx]
+            fastgguf serve   model.gguf [model2.gguf ...] [port] [ctx]
+            fastgguf inspect model.gguf
+            fastgguf gpu
+            fastgguf selftest
+
+          The "compat" build is for old CPUs without AVX2 (before 2013); it is much slower.
+          Full documentation: https://github.com/${{ github.repository }}
+          EOF
+          for d in win win-compat; do cp chat.bat server.bat dist/README.txt dist/$d/; done
+          cp run.sh dist/README.txt dist/linux/
+          cd dist
+          (cd win && zip -q -9 ../fastgguf-$TAG-windows-x64.zip *)
+          (cd win-compat && zip -q -9 ../fastgguf-$TAG-windows-x64-compat.zip *)
+          tar -C linux -czf fastgguf-$TAG-linux-x64.tar.gz .
+          ls -la
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-files
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+
+  test-windows:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-files
+      - name: Test both Windows builds
+        shell: pwsh
+        run: |
+          foreach ($z in Get-ChildItem *.zip) {
+            $d = $z.BaseName
+            Expand-Archive $z.FullName -DestinationPath $d
+            & "$d\fastgguf.exe" selftest
+            if ($LASTEXITCODE -ne 0) { throw "selftest failed in $d" }
+          }
+
+  publish:
+    needs: [build, test-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-files
+          path: dist
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<EOF
+          ## Downloads
+
+          | File | For |
+          |---|---|
+          | \`fastgguf-$TAG-windows-x64.zip\` | **Windows 10/11, most PCs** (Intel 2013+ / AMD Ryzen, AVX2) |
+          | \`fastgguf-$TAG-windows-x64-compat.zip\` | Windows on old CPUs without AVX2 (slower) |
+          | \`fastgguf-$TAG-linux-x64.tar.gz\` | Linux x86-64 with AVX2 |
+
+          **Windows quick start:** unzip, then drag a \`.gguf\` model onto \`chat.bat\` (terminal chat)
+          or \`server.bat\` (web chat at http://localhost:8080). No installation needed — static \`.exe\`,
+          GPU (NVIDIA / AMD / Intel) used automatically through the graphics driver.
+
+          All binaries passed \`fastgguf selftest\` (Windows builds tested on a Windows runner).
+          See the [README](https://github.com/${{ github.repository }}#readme) for supported models and settings.
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "fastgguf $TAG" --notes-file notes.md --target "$GITHUB_SHA"
+          fi
