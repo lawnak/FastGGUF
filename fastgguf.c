@@ -832,6 +832,123 @@ static float dot_q8_0_q8(const uint8_t *row, const q8_blk_t *xq, int nb) {
 #endif
 }
 
+// -------------------------------------------------------------------------
+// Q4_1 / Q5_0 / Q5_1 against Q8-quantized x. Element j of a 32-block is nibble j (low
+// nibbles first, then high nibbles — the nibbles32 layout) plus, for Q5, bit j of qh as bit 4.
+//   Q5_0: d*(q5-16)      → d*xd*Σ((q5-16)·y)
+//   Q4_1: d*q4 + m       → d*xd*Σ(q4·y) + m*xd*Σy
+//   Q5_1: d*q5 + m       → d*xd*Σ(q5·y) + m*xd*Σy     (Σy = s16[0] + s16[1])
+// -------------------------------------------------------------------------
+
+#if defined(__AVX2__)
+// 32 bits → 32 bytes: 0xFF where the bit is set, 0x00 otherwise (byte j = bit j)
+static inline __m256i bytes_from_bits_32(const uint8_t *p) {
+    uint32_t x32;
+    memcpy(&x32, p, 4);
+    const __m256i shuf = _mm256_set_epi64x(0x0303030303030303LL, 0x0202020202020202LL,
+                                           0x0101010101010101LL, 0x0000000000000000LL);
+    __m256i bytes = _mm256_shuffle_epi8(_mm256_set1_epi32((int)x32), shuf);
+    bytes = _mm256_or_si256(bytes, _mm256_set1_epi64x(0x7fbfdfeff7fbfdfeLL));
+    return _mm256_cmpeq_epi8(bytes, _mm256_set1_epi64x(-1));
+}
+#endif
+
+// value of element j (0..31) of a Q5 block before the offset: nibble | (qh bit j) << 4
+static inline int q5_elem(const uint8_t *qs, uint32_t qh, int j) {
+    int nib = j < 16 ? (qs[j] & 0x0F) : (qs[j - 16] >> 4);
+    return nib | (int)(((qh >> j) & 1u) << 4);
+}
+
+// dot(Q5_0 row, Q8-quantized x)
+static float dot_q5_0_q8(const uint8_t *row, const q8_blk_t *xq, int nb) {
+#if defined(__AVX2__)
+    __m256 acc = _mm256_setzero_ps();
+    const __m256i f0 = _mm256_set1_epi8((char)0xF0);
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *p = row + b * 22;
+        float d = FP16(rd_u16(p)) * xq[b].d;
+        // q5 - 16 as int8: high bit set → nibble, high bit clear → nibble | 0xF0 (= nibble - 16)
+        __m256i hb = _mm256_andnot_si256(bytes_from_bits_32(p + 2), f0);
+        __m256i bx = _mm256_or_si256(nibbles32(p + 6), hb);
+        __m256i by = _mm256_loadu_si256((const __m256i *)xq[b].qs);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(mul_sum_i8(bx, by)), acc);
+    }
+    return hsum_ps(acc);
+#else
+    float sum = 0.0f;
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *p = row + b * 22;
+        uint32_t qh = rd_u32(p + 2);
+        int si = 0;
+        for (int j = 0; j < 32; j++) si += (q5_elem(p + 6, qh, j) - 16) * xq[b].qs[j];
+        sum += FP16(rd_u16(p)) * xq[b].d * (float)si;
+    }
+    return sum;
+#endif
+}
+
+// dot(Q5_1 row, Q8-quantized x)
+static float dot_q5_1_q8(const uint8_t *row, const q8_blk_t *xq, int nb) {
+#if defined(__AVX2__)
+    __m256 acc = _mm256_setzero_ps();
+    float macc = 0.0f;
+    const __m256i x10 = _mm256_set1_epi8(0x10);
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *p = row + b * 24;
+        float xd = xq[b].d;
+        __m256i hb = _mm256_and_si256(bytes_from_bits_32(p + 4), x10);
+        __m256i bx = _mm256_or_si256(nibbles32(p + 8), hb);          // q5 in 0..31
+        __m256i by = _mm256_loadu_si256((const __m256i *)xq[b].qs);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(FP16(rd_u16(p)) * xd),
+                              _mm256_cvtepi32_ps(mul_sum_i8(bx, by)), acc);
+        macc += FP16(rd_u16(p + 2)) * xd * (float)(xq[b].s16[0] + xq[b].s16[1]);
+    }
+    return hsum_ps(acc) + macc;
+#else
+    float sum = 0.0f;
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *p = row + b * 24;
+        uint32_t qh = rd_u32(p + 4);
+        int si = 0;
+        for (int j = 0; j < 32; j++) si += q5_elem(p + 8, qh, j) * xq[b].qs[j];
+        sum += FP16(rd_u16(p)) * xq[b].d * (float)si +
+               FP16(rd_u16(p + 2)) * xq[b].d * (float)(xq[b].s16[0] + xq[b].s16[1]);
+    }
+    return sum;
+#endif
+}
+
+// dot(Q4_1 row, Q8-quantized x)
+static float dot_q4_1_q8(const uint8_t *row, const q8_blk_t *xq, int nb) {
+#if defined(__AVX2__)
+    __m256 acc = _mm256_setzero_ps();
+    float macc = 0.0f;
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *p = row + b * 20;
+        float xd = xq[b].d;
+        __m256i bx = nibbles32(p + 4);                                 // q4 in 0..15
+        __m256i by = _mm256_loadu_si256((const __m256i *)xq[b].qs);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(FP16(rd_u16(p)) * xd),
+                              _mm256_cvtepi32_ps(mul_sum_i8(bx, by)), acc);
+        macc += FP16(rd_u16(p + 2)) * xd * (float)(xq[b].s16[0] + xq[b].s16[1]);
+    }
+    return hsum_ps(acc) + macc;
+#else
+    float sum = 0.0f;
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *p = row + b * 20;
+        int si = 0;
+        for (int j = 0; j < 16; j++) {
+            si += (int)(p[4 + j] & 0x0F) * xq[b].qs[j];
+            si += (int)(p[4 + j] >> 4)   * xq[b].qs[j + 16];
+        }
+        sum += FP16(rd_u16(p)) * xq[b].d * (float)si +
+               FP16(rd_u16(p + 2)) * xq[b].d * (float)(xq[b].s16[0] + xq[b].s16[1]);
+    }
+    return sum;
+#endif
+}
+
 
 #if defined(__AVX2__)
 // horizontal sum of 8 i32 values
@@ -1735,7 +1852,8 @@ static void matvec_init_scratch(int max_cols) {
 
 // does this type have an integer kernel that works on Q8-quantized x?
 static int type_uses_q8(uint32_t type, int cols) {
-    return ((type == T_Q4_0 || type == T_Q8_0 || type == T_IQ4_NL) && (cols % 32 == 0)) ||
+    return ((type == T_Q4_0 || type == T_Q8_0 || type == T_IQ4_NL || type == T_Q4_1 ||
+             type == T_Q5_0 || type == T_Q5_1) && (cols % 32 == 0)) ||
            ((type == T_Q2_K || type == T_Q3_K || type == T_Q4_K || type == T_Q5_K ||
              type == T_Q6_K || type == T_IQ4_XS) && (cols % 256 == 0));
 }
@@ -1748,6 +1866,9 @@ static inline float dot_row(uint32_t type, int use_q8, const uint8_t *rb,
     switch (use_q8 ? type : 0xFFFF) {
     case T_Q4_0: return dot_q4_0_q8(rb, xq, nb32);
     case T_Q8_0: return dot_q8_0_q8(rb, xq, nb32);
+    case T_Q4_1: return dot_q4_1_q8(rb, xq, nb32);
+    case T_Q5_0: return dot_q5_0_q8(rb, xq, nb32);
+    case T_Q5_1: return dot_q5_1_q8(rb, xq, nb32);
     case T_Q2_K: return dot_q2_K_q8(rb, xq, nb256);
     case T_Q3_K: return dot_q3_K_q8(rb, xq, nb256);
     case T_Q4_K: return dot_q4_K_q8(rb, xq, nb256);
@@ -3809,6 +3930,44 @@ static int cmd_selftest(void) {
                rel < 1e-4 ? "OK" : "FAIL");
         if (rel >= 1e-4) fails++;
         free(row); free(x); free(xq);
+    }
+
+    // --- Q4_1 / Q5_0 / Q5_1: integer kernel against dequantized row · dequantized x ---
+    // error relative to Σ|term|, since the min term of Q4_1/Q5_1 can cancel most of the sum
+    {
+        static const struct { uint32_t type; const char *name; int bytes, n_scales; } qt[3] = {
+            { T_Q4_1, "Q4_1", 20, 2 }, { T_Q5_0, "Q5_0", 22, 1 }, { T_Q5_1, "Q5_1", 24, 2 },
+        };
+        float *x = (float *)malloc(n * sizeof(float));
+        for (int i = 0; i < n; i++) x[i] = (float)(rand() % 2000 - 1000) / 500.0f;
+        q8_blk_t *xq = (q8_blk_t *)malloc(nb * sizeof(q8_blk_t));
+        quantize_q8(x, xq, n);
+        float *xdq = (float *)malloc(n * sizeof(float));
+        for (int b = 0; b < nb; b++)
+            for (int j = 0; j < 32; j++) xdq[b * 32 + j] = xq[b].d * (float)xq[b].qs[j];
+        float *dq = (float *)malloc(n * sizeof(float));
+        for (int t = 0; t < 3; t++) {
+            int bb = qt[t].bytes;
+            uint8_t *row = (uint8_t *)malloc((size_t)nb * bb);
+            for (int i = 0; i < nb * bb; i++) row[i] = (uint8_t)(rand() & 0xFF);
+            for (int b = 0; b < nb; b++)        // sane fp16 d (and m, which may be negative)
+                for (int k = 0; k < qt[t].n_scales; k++) {
+                    uint16_t h = (uint16_t)(0x2C00 + (rand() & 0x3FF)) | (k && (rand() & 1) ? 0x8000 : 0);
+                    memcpy(row + b * bb + 2 * k, &h, 2);
+                }
+            float fast = qt[t].type == T_Q4_1 ? dot_q4_1_q8(row, xq, nb)
+                       : qt[t].type == T_Q5_0 ? dot_q5_0_q8(row, xq, nb)
+                       :                        dot_q5_1_q8(row, xq, nb);
+            dequantize_row(qt[t].type, row, dq, n);
+            float fref = 0.0f, mag = 0.0f;
+            for (int i = 0; i < n; i++) { fref += dq[i] * xdq[i]; mag += fabsf(dq[i] * xdq[i]); }
+            float rel = fabsf(fast - fref) / (mag + 1e-6f);
+            printf("%s  fast=%.6f float_ref=%.6f rel_err=%.2e %s\n", qt[t].name, fast, fref, rel,
+                   rel < 1e-4 ? "OK" : "FAIL");
+            if (rel >= 1e-4) fails++;
+            free(row);
+        }
+        free(x); free(xq); free(xdq); free(dq);
     }
 
 
