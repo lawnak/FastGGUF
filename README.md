@@ -156,17 +156,16 @@ Qwen2 MoE (shared experts), GPT-OSS, vision/multimodal projectors, embedding mod
 | **Q4_K** (in Q4_K_M files) | 4.5 | fast integer kernel | yes | best size/quality balance |
 | **Q5_K, Q6_K** | 5.5, 6.6 | fast | yes | higher quality |
 | **Q8_0** | 8.5 | fast | yes | near-lossless |
-| **Q4_0** | 4.5 | fastest kernel | yes | **best choice for small models (< 2B)**, see [Speed](#speed) |
+| **Q4_0** | 4.5 | fastest kernel | yes | a little faster than Q4_K_M for small models (< 2B), see [Speed](#speed) |
 | **IQ4_NL** | 4.5 | fast | yes | |
 | **IQ4_XS** | 4.25 | fast | CPU only | |
 | **Q2_K, Q3_K** | 2.6, 3.4 | fast | CPU only | low quality, for very large models |
-| Q4_1, Q5_0, Q5_1 | 5–6 | **slow** (generic path) | yes | avoid on CPU |
+| Q5_0, Q5_1, Q4_1 | 5.5, 6, 5 | fast | yes | |
 | F16, BF16, F32 | 16–32 | slow (memory-bound) | yes | unquantized |
 
-> **Why "avoid Q5_0" matters:** in models whose layer width is not a multiple of 256
-> (for example Qwen2.5 0.5B, width 896, and Gemma 3 1B, width 1152), the usual Q4_K_M
-> recipe silently stores many weights as Q5_0. fastgguf has no fast kernel for Q5_0 yet, so
-> such files run several times slower. Pick the **Q4_0** or **Q8_0** file of these models.
+> **Mixed files:** in models whose layer width is not a multiple of 256 (for example Qwen2.5 0.5B,
+> width 896, and Gemma 3 1B, width 1152), a Q4_K_M file also contains Q5_0 and Q8_0 weights, and a
+> Q5_K_M file Q5_1 weights. All of these have fast kernels, so any of the usual files works well.
 
 ---
 
@@ -221,11 +220,11 @@ Measured in a cloud VM: **Intel Xeon @ 2.1 GHz, 4 vCPUs (AVX-512 + VNNI), 15 GB 
 |---|---|---|---|---|---|
 | Qwen2.5 0.5B | Q4_0 | 0.28 GB | **43.0** | 128.1 | 34 % |
 | Qwen2.5 0.5B | Q8_0 | 0.53 GB | **33.5** | 68.3 | 49 % |
-| Qwen2.5 0.5B | Q4_K_M | 0.40 GB | **7.1** | 45.0 | 16 % |
+| Qwen2.5 0.5B | Q4_K_M | 0.40 GB | **36.6** | 45.0 | 81 % |
 | Llama 3.2 1B | Q4_0 | 0.70 GB | **14.8** | 50.1 | 30 % |
 | Llama 3.2 1B | Q8_0 | 1.32 GB | **13.8** | 29.7 | 47 % |
 | Llama 3.2 1B | Q4_K_M | 0.80 GB | **10.2** | 24.3 | 42 % |
-| Gemma 3 1B | Q4_K_M | 0.81 GB | **4.0** | 25.4 | 16 % |
+| Gemma 3 1B | Q4_K_M | 0.81 GB | **17.9** | 25.4 | 71 % |
 | Qwen2.5 1.5B | Q4_K_M | 0.98 GB | **10.2** | 20.5 | 50 % |
 | Llama 3.2 3B | Q4_K_M | 2.01 GB | **5.1** | 11.2 | 45 % |
 | Qwen3 4B | Q4_K_M | 2.50 GB | **3.7** | 9.0 | 42 % |
@@ -233,8 +232,8 @@ Measured in a cloud VM: **Intel Xeon @ 2.1 GHz, 4 vCPUs (AVX-512 + VNNI), 15 GB 
 
 **What the numbers say**
 
-- fastgguf runs at **roughly 30–50 % of llama.cpp's speed** on this CPU (40–50 % for Q4_K_M / Q8_0 models,
-  30–34 % for Q4_0). Both scale the same way with threads (Llama 3.2 1B Q4_K_M):
+- fastgguf runs at **roughly 30–80 % of llama.cpp's speed** on this CPU (most Q4_K_M / Q8_0 models 40–50 %,
+  Q4_0 30–34 %). Both scale the same way with threads (Llama 3.2 1B Q4_K_M):
 
 | Threads | fastgguf tok/s | llama.cpp tok/s |
 |---|---|---|
@@ -242,9 +241,9 @@ Measured in a cloud VM: **Intel Xeon @ 2.1 GHz, 4 vCPUs (AVX-512 + VNNI), 15 GB 
 | 2 | 6.1 | 12.7 |
 | 4 | 10.6 | 23.2 |
 
-- **Gemma 3 1B and Qwen2.5 0.5B in Q4_K_M are 6× slower than llama.cpp**: their Q4_K_M files contain Q5_0
-  weights, which have no fast kernel in fastgguf yet. Use their **Q4_0 or Q8_0** files instead
-  (Qwen2.5 0.5B: 7.1 → 43.0 tok/s).
+- Gemma 3 1B and Qwen2.5 0.5B store many Q4_K_M weights as Q5_0 (their layer widths are not multiples of
+  256). Since the Q5_0 / Q5_1 / Q4_1 integer kernels were added, these files run **4.5–5× faster** than
+  before (Qwen2.5 0.5B: 7.1 → 36.6 tok/s, Gemma 3 1B: 4.0 → 17.9 tok/s).
 - A 4-core, 2.1 GHz cloud VM is slow hardware; a recent desktop with more cores and faster memory should be several
   times faster (not measured here). Run `tools/bench.py` to get numbers for your own machine.
 - For reference, people read at roughly 5 tokens per second, so anything above that feels fluent.
@@ -292,7 +291,7 @@ almost all models; otherwise the normal cache is used).
 ### Tips for more speed
 
 1. Use a discrete GPU if you have one (it is used automatically).
-2. Prefer **Q4_K_M** for models ≥ 3B and **Q4_0** for small ones.
+2. **Q4_K_M** is a good default; **Q4_0** is a bit faster for small models (lower quality).
 3. Build with `make` on the machine that runs it (`-march=native` enables VNNI/AVX-512).
 4. On laptops, plug in the charger (fastgguf already opts out of Windows 11 power throttling).
 5. Close memory-heavy programs; the model must fit in RAM to avoid disk reads.
@@ -403,8 +402,7 @@ real model's, because speed depends only on the sizes and weight types.
 
 - Prompts are processed one token at a time (no batched prompt processing), so very long
   prompts are slower than in llama.cpp.
-- CPU speed is currently below llama.cpp (see [Speed](#speed)); no fast kernels yet for
-  Q4_1 / Q5_0 / Q5_1 or ARM NEON.
+- CPU speed is currently below llama.cpp (see [Speed](#speed)); no ARM NEON kernels yet.
 - The server handles one request at a time.
 - Text only: no images/audio, no tool calling / JSON mode, no embeddings endpoint.
 - GGUF tokenizers are matched greedily (longest token first) instead of applying BPE merges,

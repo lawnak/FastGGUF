@@ -18,8 +18,9 @@
     {
       "model": "qwen2.5-0.5b-q4_k_m",
       "gb": 0.395,
-      "fastgguf": 7.1,
-      "llamacpp": 44.98
+      "fastgguf": 36.64,
+      "llamacpp": 44.98,
+      "fastgguf_before_q5_0_kernel": 7.1
     },
     {
       "model": "llama-3.2-1b-q4_0",
@@ -42,8 +43,9 @@
     {
       "model": "gemma-3-1b-q4_k_m",
       "gb": 0.806,
-      "fastgguf": 3.96,
-      "llamacpp": 25.36
+      "fastgguf": 17.93,
+      "llamacpp": 25.36,
+      "fastgguf_before_q5_0_kernel": 3.96
     },
     {
       "model": "qwen2.5-1.5b-q4_k_m",
