@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/logo.webp" alt="fastgguf logo" width="400">
+</p>
+
 # fastgguf
 
 **Run large language models (GGUF files) on your own computer — one C file, no dependencies.**
