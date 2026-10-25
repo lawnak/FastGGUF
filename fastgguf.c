@@ -1497,10 +1497,34 @@ static float dot_iq4_xs_q8(const uint8_t *row, const q8_blk_t *xq, int nb256) {
 }
 
 // plain float dot product (the compiler auto-vectorizes it with -O3 -march=native)
+// float dot product — used by attention (q·k per position) and the generic float path.
+// AVX2: two 8-wide accumulators (a plain loop is one long chain of dependent adds, because
+// the compiler may not reorder float sums)
 static float dot_f32v(const float *a, const float *b, int n) {
-    float s = 0.0f;
-    for (int i = 0; i < n; i++) s += a[i] * b[i];
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s0);
+        s1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), s1);
+    }
+    if (i + 8 <= n) {
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s0);
+        i += 8;
+    }
+    float s = hsum_ps(_mm256_add_ps(s0, s1));
+    for (; i < n; i++) s += a[i] * b[i];
     return s;
+#else
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        s0 += a[i] * b[i]; s1 += a[i + 1] * b[i + 1];
+        s2 += a[i + 2] * b[i + 2]; s3 += a[i + 3] * b[i + 3];
+    }
+    for (; i < n; i++) s0 += a[i] * b[i];
+    return (s0 + s1) + (s2 + s3);
+#endif
 }
 
 static float dot_f16_row(const uint8_t *row, const float *x, int n) {
@@ -2216,11 +2240,18 @@ static inline float silu_f(float x) { return x / (1.0f + expf(-x)); }
 static void apply_rope(float *x, int total, int pos, int head_dim, int n_rot,
                        double base, double freq_scale, const float *freq_factors, int neox) {
     int half = n_rot / 2;
+    // the angles depend only on the position and the pair index, not on the head: compute once
+    float cs[512], sn[512];
+    if (half > 512) half = 512;
+    for (int j = 0; j < half; j++) {
+        double theta = (double)pos * freq_scale / pow(base, (double)(2 * j) / (double)n_rot);
+        if (freq_factors) theta /= (double)freq_factors[j];
+        cs[j] = (float)cos(theta);
+        sn[j] = (float)sin(theta);
+    }
     for (int ho = 0; ho + head_dim <= total; ho += head_dim) {
         for (int j = 0; j < half; j++) {
-            double theta = (double)pos * freq_scale / pow(base, (double)(2 * j) / (double)n_rot);
-            if (freq_factors) theta /= (double)freq_factors[j];
-            float c = (float)cos(theta), s = (float)sin(theta);
+            float c = cs[j], s = sn[j];
             int i0 = neox ? ho + j : ho + 2 * j;
             int i1 = neox ? ho + j + half : ho + 2 * j + 1;
             float v0 = x[i0], v1 = x[i1];
@@ -3383,6 +3414,7 @@ static int model_load(model_t *m, gguf_t *g, int n_ctx) {
     m->up       = (float *)malloc(max_ff * sizeof(float));
     m->ffn_out  = (float *)malloc(m->n_embd * sizeof(float));
     m->scores   = (float *)malloc(n_ctx * sizeof(float));
+    m->bscores  = (float *)malloc((size_t)omp_get_max_threads() * n_ctx * sizeof(float)); // per thread
     if (m->kvq == 2) { // debug mode: unrotated copy of q + reference output + reference scores
         m->dbg_q      = (float *)malloc(max_q * sizeof(float));
         m->dbg_o      = (float *)malloc(max_q * sizeof(float));
@@ -3652,7 +3684,12 @@ static float *forward(model_t *m, int token, int pos) {
         if (m->kvq == 2) memset(m->dbg_o, 0, (size_t)L->q_dim * sizeof(float));
 
         memset(m->attn_out, 0, (size_t)L->q_dim * sizeof(float));
+        // heads are independent: split them over the threads (each has its own scores buffer);
+        // the KV debug mode (kvq == 2) shares buffers and stays on one thread
+        int par = m->kvq != 2 && (long)np * L->n_head >= 2048;
+        #pragma omp parallel for schedule(static) if(par)
         for (int h = 0; h < L->n_head; h++) {
+            float *scores = par ? m->bscores + (size_t)omp_get_thread_num() * m->n_ctx : m->scores;
             int kvh = h * n_head_kv / L->n_head;
             const float *qh = m->q + h * hd;
             int kvo = kvh * hd;
@@ -3660,12 +3697,12 @@ static float *forward(model_t *m, int token, int pos) {
                 for (int p = start; p <= pos; p++) {
                     const uint8_t *rk = ckq + (size_t)(p % cache_cap) * kqs
                                       + kvh * KVQ_REC(hd, m->kvq_kbits);
-                    m->scores[p - start] = kvq_dot_k(qh, rk, hd, m->kvq_kbits) * qk_scale;
+                    scores[p - start] = kvq_dot_k(qh, rk, hd, m->kvq_kbits) * qk_scale;
                 }
             } else {
                 for (int p = start; p <= pos; p++) {
                     const float *pk = ck + (size_t)(p % cache_cap) * kv_dim + kvo;
-                    m->scores[p - start] = dot_f32v(qh, pk, hd) * qk_scale;
+                    scores[p - start] = dot_f32v(qh, pk, hd) * qk_scale;
                 }
             }
             if (m->kvq == 2) { // reference: the same computation with unrotated q and the f32 cache
@@ -3674,7 +3711,7 @@ static float *forward(model_t *m, int token, int pos) {
                     const float *pk = ck + (size_t)(p % cache_cap) * kv_dim + kvo;
                     float sf = dot_f32v(qf, pk, hd) * qk_scale;
                     m->dbg_scores[p - start] = sf;
-                    float d = fabsf(m->scores[p - start] - sf);
+                    float d = fabsf(scores[p - start] - sf);
                     if (d > dbg_serr) dbg_serr = d;
                     if (fabsf(sf) > dbg_smax) dbg_smax = fabsf(sf);
                 }
@@ -3687,10 +3724,10 @@ static float *forward(model_t *m, int token, int pos) {
                     for (int i = 0; i < hd; i++) od[i] += w * pv[i];
                 }
             }
-            softmax_inplace(m->scores, np);
+            softmax_inplace(scores, np);
             float *oh = m->attn_out + h * hd;
             for (int p = start; p <= pos; p++) {
-                float w = m->scores[p - start];
+                float w = scores[p - start];
                 if (w == 0.0f) continue;
                 if (m->kvq) {
                     kvq_axpy_v(oh, w, cvq + (size_t)(p % cache_cap) * vqs
@@ -3794,7 +3831,6 @@ static int batch_alloc(model_t *m) {
     m->bv    = (float *)malloc(B * max_kv * sizeof(float));
     m->bgate = (float *)malloc(B * max_ff * sizeof(float));
     m->bup   = (float *)malloc(B * max_ff * sizeof(float));
-    m->bscores = (float *)malloc((size_t)omp_get_max_threads() * m->n_ctx * sizeof(float));
     if (!m->bx || !m->bcur || !m->bao || !m->bf || !m->bffn || !m->bq || !m->batt || !m->bk ||
         !m->bv || !m->bgate || !m->bup || !m->bscores) return -1;
     return 0;

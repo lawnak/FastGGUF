@@ -239,8 +239,18 @@ Measured in a cloud VM: **Intel Xeon @ 2.8 GHz, 4 vCPUs (AVX-512), 15 GB RAM, no
 
 - fastgguf generates text at **roughly 60–85 % of llama.cpp's speed** on this CPU (Q4_K_M and Q8_0 files
   60–85 %, Q4_0 62–65 %, where llama.cpp re-arranges the weights into a faster layout at load time).
-- On a single core the two are close; llama.cpp spreads more of each token's work across cores, so the
-  gap grows with more threads (Llama 3.2 1B Q4_K_M):
+- **Long conversations:** attention (looking back over the whole conversation) now runs on all cores
+  with vectorized dot products, so generation slows down much less as the context grows. With 1,500
+  tokens already in the context (tokens/s):
+
+| Model | v0.4.0 | **now** | llama.cpp |
+|---|---|---|---|
+| Llama 3.2 3B Q4_K_M | 3.1 | **7.7** | 7.5 |
+| Gemma 3 1B Q4_K_M | 12.1 | **17.8** | 18.2 |
+| Llama 3.2 1B Q4_K_M | 8.8 | **18.0** | 21.3 |
+| Qwen2.5 0.5B Q4_0 | 14.8 | **27.4** | 40.0 |
+
+- Thread scaling at short context (Llama 3.2 1B Q4_K_M):
 
 | Threads | fastgguf tok/s | llama.cpp tok/s |
 |---|---|---|
@@ -423,8 +433,8 @@ real model's, because speed depends only on the sizes and weight types.
 
 - Prompt reading is batched but about 3× slower than llama.cpp; Gemma 4 models still read
   prompts token by token.
-- Generation is 15–40 % slower than llama.cpp on CPU (see [Speed](#speed)): attention, normalization
-  and activation rounding still run on one core. No ARM NEON kernels yet.
+- Generation with a short context is 15–40 % slower than llama.cpp on CPU (see [Speed](#speed));
+  with long contexts the two are close. No ARM NEON kernels yet.
 - The server handles one request at a time.
 - Text only: no images/audio, no tool calling / JSON mode, no embeddings endpoint.
 - GGUF tokenizers are matched greedily (longest token first) instead of applying BPE merges,
