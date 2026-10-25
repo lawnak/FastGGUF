@@ -1176,6 +1176,138 @@ static float dot_q6_K_q8k(const uint8_t *row, const q8k_blk_t *y, int nb) {
     return sum;
 }
 
+// -------------------------------------------------------------------------
+// Four inputs at once (prompt batches): each weight block is loaded and unpacked once and
+// multiplied with 4 activation vectors. Same integer math as the single-input kernels above,
+// so the results are identical; non-AVX2 builds just call the single kernel 4 times.
+// -------------------------------------------------------------------------
+
+static void dot_q4_K_q8k_x4(const uint8_t *row, const q8k_blk_t *const y[4], int nb, float out[4]) {
+#if defined(__AVX2__)
+    const __m256i m4 = _mm256_set1_epi8(0x0F);
+    __m256 acc[4] = { _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps() };
+    float mins[4] = { 0, 0, 0, 0 };
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *p = row + b * 144, *qs = p + 16;
+        uint8_t sm[16];
+        unpack_scales_k4(p + 4, sm);
+        float d = FP16(rd_u16(p)), dmin = FP16(rd_u16(p + 2));
+        __m256i s0 = _mm256_setzero_si256(), s1 = s0, s2 = s0, s3 = s0;
+        for (int j = 0; j < 4; j++) {
+            __m256i q4 = _mm256_loadu_si256((const __m256i *)(qs + 32 * j));
+            __m256i lo = _mm256_and_si256(q4, m4);
+            __m256i hi = _mm256_and_si256(_mm256_srli_epi16(q4, 4), m4);
+            __m256i sl = _mm256_set1_epi16(sm[2 * j]), sh = _mm256_set1_epi16(sm[2 * j + 1]);
+#define Q4K_T(t, acc_i) { const int8_t *q8 = y[t][b].qs + 64 * j; \
+            __m256i pl = _mm256_madd_epi16(_mm256_maddubs_epi16(lo, _mm256_loadu_si256((const __m256i *)q8)), sl); \
+            __m256i ph = _mm256_madd_epi16(_mm256_maddubs_epi16(hi, _mm256_loadu_si256((const __m256i *)(q8 + 32))), sh); \
+            acc_i = _mm256_add_epi32(acc_i, _mm256_add_epi32(pl, ph)); }
+            Q4K_T(0, s0) Q4K_T(1, s1) Q4K_T(2, s2) Q4K_T(3, s3)
+#undef Q4K_T
+        }
+        __m256i ss[4] = { s0, s1, s2, s3 };
+        for (int t = 0; t < 4; t++) {
+            float yd = y[t][b].d;
+            acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * yd), _mm256_cvtepi32_ps(ss[t]), acc[t]);
+            mins[t] += dmin * yd * (float)k4_min_sum(sm, &y[t][b]);
+        }
+    }
+    for (int t = 0; t < 4; t++) out[t] = hsum_ps(acc[t]) - mins[t];
+#else
+    for (int t = 0; t < 4; t++) out[t] = dot_q4_K_q8k(row, y[t], nb);
+#endif
+}
+
+static void dot_q6_K_q8k_x4(const uint8_t *row, const q8k_blk_t *const y[4], int nb, float out[4]) {
+#if defined(__AVX2__)
+    const __m256i m4 = _mm256_set1_epi8(0x0F), m3 = _mm256_set1_epi8(3);
+    __m256 acc[4] = { _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps() };
+    float corr[4] = { 0, 0, 0, 0 };
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *p = row + b * 210;
+        const int8_t *sc = (const int8_t *)(p + 192);
+        float d = FP16(rd_u16(p + 208));
+        __m256i s0 = _mm256_setzero_si256(), s1 = s0, s2 = s0, s3 = s0;
+        for (int half = 0; half < 2; half++) {
+            const uint8_t *ql = p + half * 64, *qh = p + 128 + half * 32;
+            const int8_t *s = sc + half * 8;
+            __m256i a0 = _mm256_loadu_si256((const __m256i *)ql);
+            __m256i a1 = _mm256_loadu_si256((const __m256i *)(ql + 32));
+            __m256i hh = _mm256_loadu_si256((const __m256i *)qh);
+            __m256i q[4];
+            q[0] = _mm256_or_si256(_mm256_and_si256(a0, m4),
+                                   _mm256_slli_epi16(_mm256_and_si256(hh, m3), 4));
+            q[1] = _mm256_or_si256(_mm256_and_si256(a1, m4),
+                                   _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(hh, 2), m3), 4));
+            q[2] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(a0, 4), m4),
+                                   _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(hh, 4), m3), 4));
+            q[3] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(a1, 4), m4),
+                                   _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(hh, 6), m3), 4));
+            for (int k = 0; k < 4; k++) {
+                __m256i sv = _mm256_insertf128_si256(_mm256_castsi128_si256(_mm_set1_epi16(s[2 * k])),
+                                                     _mm_set1_epi16(s[2 * k + 1]), 1);
+#define Q6K_T(t, acc_i) acc_i = _mm256_add_epi32(acc_i, _mm256_madd_epi16(_mm256_maddubs_epi16(q[k], \
+                _mm256_loadu_si256((const __m256i *)(y[t][b].qs + half * 128 + 32 * k))), sv));
+                Q6K_T(0, s0) Q6K_T(1, s1) Q6K_T(2, s2) Q6K_T(3, s3)
+#undef Q6K_T
+            }
+        }
+        __m256i ss[4] = { s0, s1, s2, s3 };
+        for (int t = 0; t < 4; t++) {
+            float dd = d * y[t][b].d;
+            int c = 0;
+            for (int g = 0; g < 16; g++) c += sc[g] * y[t][b].bsums[g];
+            acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(dd), _mm256_cvtepi32_ps(ss[t]), acc[t]);
+            corr[t] += dd * 32.0f * (float)c;
+        }
+    }
+    for (int t = 0; t < 4; t++) out[t] = hsum_ps(acc[t]) - corr[t];
+#else
+    for (int t = 0; t < 4; t++) out[t] = dot_q6_K_q8k(row, y[t], nb);
+#endif
+}
+
+#if defined(__AVX2__)
+// mul_sum_i8 with the |a| part precomputed (a is shared by the 4 inputs)
+static inline __m256i mul_sum_i8_pre(__m256i a, __m256i ax, __m256i b) {
+    __m256i sy = _mm256_sign_epi8(b, a);
+#if defined(__AVXVNNI__)
+    return _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), ax, sy);
+#elif defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    return _mm256_dpbusd_epi32(_mm256_setzero_si256(), ax, sy);
+#else
+    return _mm256_madd_epi16(_mm256_maddubs_epi16(ax, sy), _mm256_set1_epi16(1));
+#endif
+}
+#endif
+
+// 32-element block types (Q8_0 / Q4_0 / Q5_0): bytes per block and how to get the int8 values
+static void dot_q32_q8_x4(uint32_t type, const uint8_t *row, const q8_blk_t *const y[4], int nb, float out[4]) {
+#if defined(__AVX2__)
+    int bb = type == T_Q8_0 ? 34 : type == T_Q4_0 ? 18 : 22;
+    const __m256i f0 = _mm256_set1_epi8((char)0xF0), off8 = _mm256_set1_epi8(8);
+    __m256 acc[4] = { _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps() };
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *p = row + b * bb;
+        __m256i bx;
+        if (type == T_Q8_0)      bx = _mm256_loadu_si256((const __m256i *)(p + 2));
+        else if (type == T_Q4_0) bx = _mm256_sub_epi8(nibbles32(p + 2), off8);
+        else bx = _mm256_or_si256(nibbles32(p + 6), _mm256_andnot_si256(bytes_from_bits_32(p + 2), f0));
+        __m256i ax = _mm256_sign_epi8(bx, bx);
+        float d = FP16(rd_u16(p));
+        for (int t = 0; t < 4; t++) {
+            __m256i s = mul_sum_i8_pre(bx, ax, _mm256_loadu_si256((const __m256i *)y[t][b].qs));
+            acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * y[t][b].d), _mm256_cvtepi32_ps(s), acc[t]);
+        }
+    }
+    for (int t = 0; t < 4; t++) out[t] = hsum_ps(acc[t]);
+#else
+    for (int t = 0; t < 4; t++)
+        out[t] = type == T_Q8_0 ? dot_q8_0_q8(row, y[t], nb)
+               : type == T_Q4_0 ? dot_q4_0_q8(row, y[t], nb) : dot_q5_0_q8(row, y[t], nb);
+#endif
+}
+
 // dot(Q2_K row, Q8-quantized x) — value d*(s&0xF)*q - dmin*(s>>4) per 16 elements:
 //   Σ = d*sc*(q·xq) - dmin*m*Σxq with two scales per 32-vector (same trick as Q6_K)
 static float dot_q2_K_q8(const uint8_t *row, const q8_blk_t *xq, int nb256) {
@@ -1863,6 +1995,11 @@ static int cmd_gpuinfo(void) {
 static float **g_scratch;      // [thread][max_cols] for dequantizing K-quants
 static q8_blk_t *g_xq8;        // shared buffer for the quantized x (32-element blocks)
 static q8k_blk_t *g_xq8k;      // the same x as 256-element blocks, for K-quants
+// prompt batches: up to FG_BATCH tokens go through each layer together, so every weight row is
+// read from memory once per batch instead of once per token
+#define FG_BATCH 64
+static q8_blk_t *g_bxq8;       // [FG_BATCH][max_cols/32 + 1]
+static q8k_blk_t *g_bxq8k;     // [FG_BATCH][max_cols/256 + 1]
 static int g_max_cols;
 
 static void matvec_init_scratch(int max_cols) {
@@ -1873,12 +2010,16 @@ static void matvec_init_scratch(int max_cols) {
         free(g_scratch);
         free(g_xq8);
         free(g_xq8k);
+        free(g_bxq8);
+        free(g_bxq8k);
     }
     g_max_cols = max_cols;
     g_scratch = (float **)malloc(nt * sizeof(float *));
     for (int i = 0; i < nt; i++) g_scratch[i] = (float *)malloc((size_t)max_cols * sizeof(float));
     g_xq8 = (q8_blk_t *)malloc(((size_t)max_cols / 32 + 1) * sizeof(q8_blk_t));
     g_xq8k = (q8k_blk_t *)malloc(((size_t)max_cols / 256 + 1) * sizeof(q8k_blk_t));
+    g_bxq8 = (q8_blk_t *)malloc((size_t)FG_BATCH * ((size_t)max_cols / 32 + 1) * sizeof(q8_blk_t));
+    g_bxq8k = (q8k_blk_t *)malloc((size_t)FG_BATCH * ((size_t)max_cols / 256 + 1) * sizeof(q8k_blk_t));
 }
 
 // how x must be prepared for this weight type: ACT_Q8K (256-element blocks, K-quants),
@@ -1976,6 +2117,69 @@ static int matvec(tensor_t *t, const float *x, float *out) {
         out[r] = dot_row(t->type, use_q8, raw + (uint64_t)r * stride, g_xq8, g_xq8k, x, cols, &fail);
     if (fail) {
         fprintf(stderr, "matvec: unsupported type %s in %s\n", type_name(t->type), t->name);
+        return -1;
+    }
+    return 0;
+}
+
+// Y[b·ldy + r] = dot(W[r], X[b·ldx ...]) for b < nb (nb ≤ FG_BATCH) — each weight row is loaded once
+// and multiplied with all nb inputs while it is still in cache (prompt processing)
+static int matmul(tensor_t *t, const float *X, int ldx, float *Y, int ldy, int nb) {
+    if (nb == 1) return matvec(t, X, Y);
+    if (t->gpu && g_gpu.state == 1) {
+        for (int b = 0; b < nb; b++)
+            if (matvec(t, X + (size_t)b * ldx, Y + (size_t)b * ldy) != 0) return -1;
+        return 0;
+    }
+    int cols = (int)t->ne[0];
+    int64_t rows = 1;
+    for (int i = 1; i < t->n_dims; i++) rows *= (int64_t)t->ne[i];
+    uint64_t stride = row_stride(t->type, (uint64_t)cols);
+    const uint8_t *raw = t->data;
+    int kind = type_uses_q8(t->type, cols);
+    size_t s8 = (size_t)g_max_cols / 32 + 1, sk = (size_t)g_max_cols / 256 + 1;
+    #pragma omp parallel for schedule(static)
+    for (int b = 0; b < nb; b++)
+        quantize_act(kind, X + (size_t)b * ldx, g_bxq8 + b * s8, g_bxq8k + b * sk, cols);
+    // no integer kernel: dequantize the row once, then plain float dots with every input
+    int deq = kind == ACT_F32 && t->type != T_F32 && t->type != T_F16 && t->type != T_BF16;
+    int fail = 0;
+    #pragma omp parallel for schedule(static)
+    for (int64_t r = 0; r < rows; r++) {
+        const uint8_t *rb = raw + (uint64_t)r * stride;
+        if (deq) {
+            float *scr = g_scratch[omp_get_thread_num()];
+            if (dequantize_row(t->type, rb, scr, cols) != 0) { fail = 1; continue; }
+            for (int b = 0; b < nb; b++)
+                Y[(size_t)b * ldy + r] = dot_f32v(scr, X + (size_t)b * ldx, cols);
+        } else {
+            int b = 0;
+            // groups of 4 inputs share one unpacking of the weight row
+            if (kind == ACT_Q8K && (t->type == T_Q4_K || t->type == T_Q6_K)) {
+                for (; b + 4 <= nb; b += 4) {
+                    const q8k_blk_t *yk[4] = { g_bxq8k + b * sk, g_bxq8k + (b + 1) * sk,
+                                               g_bxq8k + (b + 2) * sk, g_bxq8k + (b + 3) * sk };
+                    float o[4];
+                    if (t->type == T_Q4_K) dot_q4_K_q8k_x4(rb, yk, cols / 256, o);
+                    else                   dot_q6_K_q8k_x4(rb, yk, cols / 256, o);
+                    for (int i = 0; i < 4; i++) Y[(size_t)(b + i) * ldy + r] = o[i];
+                }
+            } else if (kind == ACT_Q8 && (t->type == T_Q8_0 || t->type == T_Q4_0 || t->type == T_Q5_0)) {
+                for (; b + 4 <= nb; b += 4) {
+                    const q8_blk_t *yq[4] = { g_bxq8 + b * s8, g_bxq8 + (b + 1) * s8,
+                                              g_bxq8 + (b + 2) * s8, g_bxq8 + (b + 3) * s8 };
+                    float o[4];
+                    dot_q32_q8_x4(t->type, rb, yq, cols / 32, o);
+                    for (int i = 0; i < 4; i++) Y[(size_t)(b + i) * ldy + r] = o[i];
+                }
+            }
+            for (; b < nb; b++)
+                Y[(size_t)b * ldy + r] = dot_row(t->type, kind, rb, g_bxq8 + b * s8, g_bxq8k + b * sk,
+                                                 X + (size_t)b * ldx, cols, &fail);
+        }
+    }
+    if (fail) {
+        fprintf(stderr, "matmul: unsupported type %s in %s\n", type_name(t->type), t->name);
         return -1;
     }
     return 0;
@@ -2845,6 +3049,9 @@ typedef struct {
     q8_blk_t *moe_xq;                  // down input quantized for every selected expert
     q8k_blk_t *moe_xk;                 // the same, as 256-element blocks (K-quant experts)
     cand_t *cand;   // sampling workspace (n_vocab)
+    // prompt batches (allocated on first use): FG_BATCH rows each; ld_* = row length
+    float *bx, *bcur, *bq, *bk, *bv, *batt, *bao, *bf, *bgate, *bup, *bffn, *bscores;
+    int ld_q, ld_kv, ld_ff;
 } model_t;
 
 // loads a whole tensor into a new float array
@@ -3134,7 +3341,10 @@ static int model_load(model_t *m, gguf_t *g, int n_ctx) {
     size_t kv_bytes = 0, kv_f32_bytes = 0;
     for (int i = 0; i < m->n_kv_from_start; i++) {
         layer_t *L = &m->layers[i];
-        int cap = m->is_swa[i] && m->n_swa > 0 ? (m->n_swa < n_ctx ? m->n_swa : n_ctx) : n_ctx;
+        // SWA ring: the window + room for one prompt batch, so writing a whole batch never
+        // overwrites positions that earlier tokens of the same batch still attend to
+        int swa_cap = m->n_swa + FG_BATCH;
+        int cap = m->is_swa[i] && m->n_swa > 0 ? (swa_cap < n_ctx ? swa_cap : n_ctx) : n_ctx;
         m->cache_cap[i] = cap;
         kv_f32_bytes += 2ULL * cap * L->kv_dim * sizeof(float);
         if (m->kvq) {
@@ -3557,6 +3767,223 @@ static float *forward(model_t *m, int token, int pos) {
 }
 
 // =========================================================================
+// Prompt processing in batches — the same math as forward(), but up to FG_BATCH tokens go through
+// each layer together: projections become matrix × matrix (matmul), attention runs in parallel
+// over (token, head). Returns the logits of the last token.
+// =========================================================================
+
+static int batch_alloc(model_t *m) {
+    if (m->bx) return 0;
+    int max_q = 1, max_kv = 1, max_ff = 1;
+    for (int i = 0; i < m->n_layer; i++) {
+        layer_t *L = &m->layers[i];
+        if (L->q_dim > max_q) max_q = L->q_dim;
+        if (L->kv_dim > max_kv) max_kv = L->kv_dim;
+        if (L->ff_dim > max_ff) max_ff = L->ff_dim;
+    }
+    m->ld_q = max_q; m->ld_kv = max_kv; m->ld_ff = max_ff;
+    size_t B = FG_BATCH, E = (size_t)m->n_embd;
+    m->bx    = (float *)malloc(B * E * sizeof(float));
+    m->bcur  = (float *)malloc(B * E * sizeof(float));
+    m->bao   = (float *)malloc(B * E * sizeof(float));
+    m->bf    = (float *)malloc(B * E * sizeof(float));
+    m->bffn  = (float *)malloc(B * E * sizeof(float));
+    m->bq    = (float *)malloc(B * max_q * sizeof(float));
+    m->batt  = (float *)malloc(B * max_q * sizeof(float));
+    m->bk    = (float *)malloc(B * max_kv * sizeof(float));
+    m->bv    = (float *)malloc(B * max_kv * sizeof(float));
+    m->bgate = (float *)malloc(B * max_ff * sizeof(float));
+    m->bup   = (float *)malloc(B * max_ff * sizeof(float));
+    m->bscores = (float *)malloc((size_t)omp_get_max_threads() * m->n_ctx * sizeof(float));
+    if (!m->bx || !m->bcur || !m->bao || !m->bf || !m->bffn || !m->bq || !m->batt || !m->bk ||
+        !m->bv || !m->bgate || !m->bup || !m->bscores) return -1;
+    return 0;
+}
+
+// one batch of nb tokens at positions pos0..pos0+nb-1; logits for the last one when want_logits
+static int forward_chunk(model_t *m, const int *toks, int nb, int pos0, int want_logits) {
+    int E = m->n_embd, LQ = m->ld_q, LKV = m->ld_kv, LF = m->ld_ff;
+    float *X = m->bx;
+
+    for (int b = 0; b < nb; b++)
+        if (read_embedding(m->tok_embd, toks[b], X + (size_t)b * E, E, m->embd_scale) != 0) return -1;
+
+    for (int il = 0; il < m->n_layer; il++) {
+        layer_t *L = &m->layers[il];
+        int swa = m->is_swa[il];
+        int hd = L->head_dim;
+        int n_rot = swa ? m->n_rot_swa : m->n_rot;
+        if (n_rot <= 0 || n_rot > hd) n_rot = hd;
+        double base = swa ? m->rope_base_swa : m->rope_base;
+        double fscale = swa ? 1.0 : m->rope_scale;
+        const float *ff = (!swa && m->rope_freqs && m->rope_freqs_n >= n_rot / 2)
+                          ? m->rope_freqs : NULL;
+
+        // attn_norm
+        for (int b = 0; b < nb; b++) {
+            memcpy(m->bcur + (size_t)b * E, X + (size_t)b * E, E * sizeof(float));
+            rmsnorm_w(m->bcur + (size_t)b * E, L->attn_norm, E, m->norm_eps);
+        }
+
+        // Q → (bias) → per-head norm → RoPE
+        if (matmul(L->wq, m->bcur, E, m->bq, LQ, nb) != 0) return -1;
+        #pragma omp parallel for schedule(static)
+        for (int b = 0; b < nb; b++) {
+            float *q = m->bq + (size_t)b * LQ;
+            if (L->bq) for (int i = 0; i < L->q_dim; i++) q[i] += L->bq[i];
+            if (L->q_norm)
+                for (int h = 0; h < L->n_head; h++) rmsnorm_w(q + h * hd, L->q_norm, hd, m->norm_eps);
+            apply_rope(q, L->q_dim, pos0 + b, hd, n_rot, base, fscale, ff, m->rope_neox);
+        }
+
+        // K/V for owning layers, written into the cache for every token of the batch
+        if (il < m->n_kv_from_start) {
+            if (matmul(L->wk, m->bcur, E, m->bk, LKV, nb) != 0) return -1;
+            if (L->wv && matmul(L->wv, m->bcur, E, m->bv, LKV, nb) != 0) return -1;
+            #pragma omp parallel for schedule(static)
+            for (int b = 0; b < nb; b++) {
+                float *k = m->bk + (size_t)b * LKV, *v = m->bv + (size_t)b * LKV;
+                int pos = pos0 + b;
+                if (L->bk) for (int i = 0; i < L->kv_dim; i++) k[i] += L->bk[i];
+                if (L->wv) { if (L->bv) for (int i = 0; i < L->kv_dim; i++) v[i] += L->bv[i]; }
+                else memcpy(v, k, L->kv_dim * sizeof(float)); // V = raw K projection
+                for (int h = 0; h < L->n_head_kv; h++) {
+                    if (L->k_norm) rmsnorm_w(k + h * hd, L->k_norm, hd, m->norm_eps);
+                    if (m->v_norm) rmsnorm_plain(v + h * hd, hd, m->norm_eps);
+                }
+                apply_rope(k, L->kv_dim, pos, hd, n_rot, base, fscale, ff, m->rope_neox);
+                int slot = pos % m->cache_cap[il];
+                if (m->kvq) {
+                    for (int h = 0; h < L->n_head_kv; h++) {
+                        kvq_rotate(k + h * hd, hd);
+                        kvq_rotate(v + h * hd, hd);
+                        kvq_quant_slice(k + h * hd, hd,
+                            m->cache_kq[il] + (size_t)slot * m->kq_stride[il] + h * KVQ_REC(hd, m->kvq_kbits),
+                            m->kvq_kbits);
+                        kvq_quant_slice(v + h * hd, hd,
+                            m->cache_vq[il] + (size_t)slot * m->vq_stride[il] + h * KVQ_REC(hd, m->kvq_vbits),
+                            m->kvq_vbits);
+                    }
+                } else {
+                    memcpy(m->cache_k[il] + (size_t)slot * L->kv_dim, k, L->kv_dim * sizeof(float));
+                    memcpy(m->cache_v[il] + (size_t)slot * L->kv_dim, v, L->kv_dim * sizeof(float));
+                }
+            }
+        }
+
+        // attention: every (token, head) pair is independent; token b sees positions up to pos0+b
+        float qk_scale = m->attn_scale > 0.0f ? m->attn_scale : 1.0f / sqrtf((float)hd);
+        int dl = m->kv_donor[il];
+        layer_t *DL = &m->layers[dl];
+        int kv_dim = DL->kv_dim, n_head_kv = DL->n_head_kv, cache_cap = m->cache_cap[dl];
+        const float *ck = m->cache_k[dl], *cv = m->cache_v[dl];
+        const uint8_t *ckq = m->cache_kq[dl], *cvq = m->cache_vq[dl];
+        int kqs = m->kq_stride[dl], vqs = m->vq_stride[dl];
+        int n_head = L->n_head;
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int bh = 0; bh < nb * n_head; bh++) {
+            int b = bh / n_head, h = bh % n_head, pos = pos0 + b;
+            float *scores = m->bscores + (size_t)omp_get_thread_num() * m->n_ctx;
+            int start = 0;
+            if (swa && m->n_swa > 0 && pos + 1 > m->n_swa) start = pos + 1 - m->n_swa;
+            if (pos + 1 - start > cache_cap) start = pos + 1 - cache_cap;
+            int np = pos + 1 - start;
+            int kvh = h * n_head_kv / n_head, kvo = kvh * hd;
+            float *qh = m->bq + (size_t)b * LQ + h * hd;
+            float *oh = m->batt + (size_t)b * LQ + h * hd;
+            if (m->kvq) {
+                kvq_rotate(qh, hd);
+                for (int p = start; p <= pos; p++)
+                    scores[p - start] = kvq_dot_k(qh, ckq + (size_t)(p % cache_cap) * kqs
+                                                  + kvh * KVQ_REC(hd, m->kvq_kbits), hd, m->kvq_kbits) * qk_scale;
+            } else {
+                for (int p = start; p <= pos; p++)
+                    scores[p - start] = dot_f32v(qh, ck + (size_t)(p % cache_cap) * kv_dim + kvo, hd) * qk_scale;
+            }
+            softmax_inplace(scores, np);
+            memset(oh, 0, hd * sizeof(float));
+            for (int p = start; p <= pos; p++) {
+                float w = scores[p - start];
+                if (w == 0.0f) continue;
+                if (m->kvq) {
+                    kvq_axpy_v(oh, w, cvq + (size_t)(p % cache_cap) * vqs
+                                    + kvh * KVQ_REC(hd, m->kvq_vbits), hd, m->kvq_vbits);
+                } else {
+                    const float *pv = cv + (size_t)(p % cache_cap) * kv_dim + kvo;
+                    for (int i = 0; i < hd; i++) oh[i] += w * pv[i];
+                }
+            }
+            if (m->kvq) kvq_unrotate(oh, hd);
+        }
+
+        // output projection + post_attention_norm + residual
+        if (matmul(L->wo, m->batt, LQ, m->bao, E, nb) != 0) return -1;
+        for (int b = 0; b < nb; b++) {
+            float *ao = m->bao + (size_t)b * E, *f = m->bf + (size_t)b * E;
+            if (L->attn_post_norm) rmsnorm_w(ao, L->attn_post_norm, E, m->norm_eps);
+            for (int i = 0; i < E; i++) ao[i] += X[(size_t)b * E + i];
+            memcpy(f, ao, E * sizeof(float));
+            rmsnorm_w(f, L->ffn_norm, E, m->norm_eps);
+        }
+
+        // FFN — GELU for Gemma, SiLU for the rest; MoE experts token by token
+        if (L->ffn_gate_inp) {
+            for (int b = 0; b < nb; b++)
+                if (moe_ffn(m, L, m->bf + (size_t)b * E, m->bffn + (size_t)b * E) != 0) return -1;
+        } else {
+            if (matmul(L->ffn_gate, m->bf, E, m->bgate, LF, nb) != 0) return -1;
+            if (matmul(L->ffn_up, m->bf, E, m->bup, LF, nb) != 0) return -1;
+            int fd = L->ff_dim, gelu = m->act_gelu;
+            #pragma omp parallel for schedule(static)
+            for (int b = 0; b < nb; b++) {
+                float *g = m->bgate + (size_t)b * LF, *u = m->bup + (size_t)b * LF;
+                if (gelu) for (int i = 0; i < fd; i++) g[i] = gelu_f(g[i]) * u[i];
+                else      for (int i = 0; i < fd; i++) g[i] = silu_f(g[i]) * u[i];
+            }
+            if (matmul(L->ffn_down, m->bgate, LF, m->bffn, E, nb) != 0) return -1;
+        }
+        for (int b = 0; b < nb; b++) {
+            float *fo = m->bffn + (size_t)b * E, *ao = m->bao + (size_t)b * E;
+            if (L->ffn_post_norm) rmsnorm_w(fo, L->ffn_post_norm, E, m->norm_eps);
+            for (int i = 0; i < E; i++) fo[i] += ao[i];
+            if (L->out_scale != 1.0f) for (int i = 0; i < E; i++) fo[i] *= L->out_scale;
+            memcpy(X + (size_t)b * E, fo, E * sizeof(float));
+        }
+    }
+
+    if (!want_logits) return 0;
+    // final norm + LM head + softcap — only the last token's logits are needed
+    memcpy(m->x, X + (size_t)(nb - 1) * E, E * sizeof(float));
+    rmsnorm_w(m->x, m->output_norm, E, m->norm_eps);
+    if (matvec(m->output, m->x, m->logits) != 0) return -1;
+    if (m->final_softcap > 0.0f) {
+        float cp = m->final_softcap;
+        for (int i = 0; i < m->n_vocab; i++) m->logits[i] = cp * tanhf(m->logits[i] / cp);
+    }
+    return 0;
+}
+
+// feed n prompt tokens starting at position pos0; returns the logits after the last one (or NULL).
+// Gemma 4 per-layer embeddings and the KV debug mode go token by token through forward(), and so
+// does everything when FASTGGUF_BATCH=0 (same results, slower — a safety switch).
+static float *forward_batch(model_t *m, const int *tokens, int n, int pos0) {
+    if (n <= 0) return NULL;
+    const char *be = getenv("FASTGGUF_BATCH");
+    int off = be && (strcmp(be, "0") == 0 || strcmp(be, "off") == 0);
+    if (n == 1 || off || m->n_ple > 0 || m->kvq == 2 || batch_alloc(m) != 0) {
+        float *lg = NULL;
+        for (int i = 0; i < n; i++)
+            if (!(lg = forward(m, tokens[i], pos0 + i))) return NULL;
+        return lg;
+    }
+    for (int c = 0; c < n; c += FG_BATCH) {
+        int nb = n - c < FG_BATCH ? n - c : FG_BATCH;
+        if (forward_chunk(m, tokens + c, nb, pos0 + c, c + nb == n) != 0) return NULL;
+    }
+    return m->logits;
+}
+
+// =========================================================================
 // Commands: chat / inspect / dump / selftest
 // =========================================================================
 
@@ -3702,12 +4129,8 @@ static int cmd_chat(const char *path, int n_ctx, int max_tokens, sampler_t *smp)
         fflush(stdout);
 
         double t0 = now_sec();
-        float *logits = NULL;
-        for (int i = 0; i < n_ids; i++) {
-            logits = forward(m, ids[i], pos);
-            if (!logits) break;
-            hist[pos++] = ids[i];
-        }
+        float *logits = forward_batch(m, ids, n_ids, pos);   // the whole message at once
+        if (logits) for (int i = 0; i < n_ids; i++) hist[pos++] = ids[i];
         free(ids);
         // the cache is now in a partial state — it cannot be built upon
         if (!logits) { printf("\n[ERROR in prompt - conversation reset]\n"); pos = 0; continue; }
@@ -4109,6 +4532,53 @@ static int cmd_selftest(void) {
     fails += test_kquant("Q4_K", T_Q4_K, 144, dot_q4_K_q8k);
     fails += test_kquant("Q5_K", T_Q5_K, 176, dot_q5_K_q8k);
     fails += test_kquant("Q6_K", T_Q6_K, 210, dot_q6_K_q8k);
+
+    // --- 4-input kernels (prompt batches) must equal 4 single-input calls ---
+    {
+        int n4 = 1024;
+        float *xs = (float *)malloc(4 * n4 * sizeof(float));
+        for (int i = 0; i < 4 * n4; i++) xs[i] = (float)(rand() % 2000 - 1000) / 500.0f;
+        q8k_blk_t *yk = (q8k_blk_t *)malloc(4 * (n4 / 256) * sizeof(q8k_blk_t));
+        q8_blk_t *yq = (q8_blk_t *)malloc(4 * (n4 / 32) * sizeof(q8_blk_t));
+        for (int t = 0; t < 4; t++) {
+            quantize_q8k(xs + t * n4, yk + t * (n4 / 256), n4);
+            quantize_q8(xs + t * n4, yq + t * (n4 / 32), n4);
+        }
+        const q8k_blk_t *pk[4] = { yk, yk + n4 / 256, yk + 2 * (n4 / 256), yk + 3 * (n4 / 256) };
+        const q8_blk_t *pq[4] = { yq, yq + n4 / 32, yq + 2 * (n4 / 32), yq + 3 * (n4 / 32) };
+        static const struct { uint32_t type; const char *name; int bytes, per; } xt[5] = {
+            { T_Q4_K, "Q4_K", 144, 256 }, { T_Q6_K, "Q6_K", 210, 256 },
+            { T_Q8_0, "Q8_0", 34, 32 }, { T_Q4_0, "Q4_0", 18, 32 }, { T_Q5_0, "Q5_0", 22, 32 },
+        };
+        for (int k = 0; k < 5; k++) {
+            int nbk = n4 / xt[k].per;
+            uint8_t *row = (uint8_t *)malloc((size_t)nbk * xt[k].bytes);
+            for (int i = 0; i < nbk * xt[k].bytes; i++) row[i] = (uint8_t)(rand() & 0xFF);
+            for (int b = 0; b < nbk; b++) {     // sane fp16 scales
+                uint16_t h = (uint16_t)(0x2C00 + (rand() & 0x3FF)), h2 = (uint16_t)(0x2400 + (rand() & 0x3FF));
+                uint8_t *p = row + b * xt[k].bytes;
+                if (xt[k].type == T_Q6_K) memcpy(p + 208, &h, 2);
+                else { memcpy(p, &h, 2); if (xt[k].type == T_Q4_K) memcpy(p + 2, &h2, 2); }
+            }
+            float o[4], worst = 0.0f;
+            if (xt[k].type == T_Q4_K) dot_q4_K_q8k_x4(row, pk, nbk, o);
+            else if (xt[k].type == T_Q6_K) dot_q6_K_q8k_x4(row, pk, nbk, o);
+            else dot_q32_q8_x4(xt[k].type, row, pq, nbk, o);
+            for (int t = 0; t < 4; t++) {
+                float one = xt[k].type == T_Q4_K ? dot_q4_K_q8k(row, pk[t], nbk)
+                          : xt[k].type == T_Q6_K ? dot_q6_K_q8k(row, pk[t], nbk)
+                          : xt[k].type == T_Q8_0 ? dot_q8_0_q8(row, pq[t], nbk)
+                          : xt[k].type == T_Q4_0 ? dot_q4_0_q8(row, pq[t], nbk) : dot_q5_0_q8(row, pq[t], nbk);
+                float e = fabsf(o[t] - one) / (fabsf(one) + 1e-3f);
+                if (e > worst) worst = e;
+            }
+            printf("%-5s x4 batch kernel vs single: rel_err=%.2e %s\n", xt[k].name, worst,
+                   worst < 1e-5f ? "OK" : "FAIL");
+            if (worst >= 1e-5f) fails++;
+            free(row);
+        }
+        free(xs); free(yk); free(yq);
+    }
 
     // --- sampler ---
     fails += test_sampler();
@@ -4720,16 +5190,14 @@ static char *run_engine(engine_t *e, msg_t *msgs, int n_msgs, int max_tokens,
         if (send_all(stream_sock, chunk, cn) != 0) { free(ids); *status = 3; return NULL; }
     }
 
-    // ingest the prompt from the point of divergence
+    // ingest the prompt from the point of divergence, in batches
     int pos = keep;
-    float *logits = NULL;
     m->seq_len = keep;
     double t0 = now_sec();
-    for (int i = keep; i < n_ids; i++) {
-        logits = forward(m, ids[i], pos);
-        if (!logits) break;
-        m->seq_ids[m->seq_len++] = ids[i];
-        pos++;
+    float *logits = forward_batch(m, ids + keep, n_ids - keep, keep);
+    if (logits) {
+        for (int i = keep; i < n_ids; i++) m->seq_ids[m->seq_len++] = ids[i];
+        pos = n_ids;
     }
     free(ids);
     if (!logits) { *status = 2; return NULL; }

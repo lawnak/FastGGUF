@@ -86,5 +86,37 @@
       "fastgguf": 17.21,
       "llamacpp": 24.84
     }
+  ],
+  "prompt_512": [
+    {
+      "model": "Llama 3.2 1B",
+      "token_by_token": 16.5,
+      "batched": 53.4,
+      "llamacpp": 173.7
+    },
+    {
+      "model": "Gemma 3 1B",
+      "token_by_token": 16.2,
+      "batched": 64.8,
+      "llamacpp": 136.6
+    },
+    {
+      "model": "Qwen2.5 1.5B",
+      "token_by_token": 13.4,
+      "batched": 38.5,
+      "llamacpp": 127.3
+    },
+    {
+      "model": "Llama 3.2 3B",
+      "token_by_token": 6.2,
+      "batched": 18.3,
+      "llamacpp": 61.5
+    },
+    {
+      "model": "Llama 3.1 8B",
+      "token_by_token": 3.1,
+      "batched": 8.6,
+      "llamacpp": 25.2
+    }
   ]
 }

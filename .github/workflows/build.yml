@@ -28,6 +28,16 @@ jobs:
           curl -sf http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
             -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":8}' | tee reply.json
           grep -q '"choices"' reply.json
+      - name: Batched prompt gives the same reply as token-by-token
+        run: |
+          P=$(python3 -c "print('The quick brown fox jumps over the lazy dog. ' * 8)")
+          for q in q8_0 q4_k_m; do
+            python tools/synth_gguf.py tiny-test $q t.gguf
+            a=$(printf '%s\n' "$P" | ./fastgguf chat t.gguf 1024 --temp 0 --max-tokens 24 | grep -a '^llama>')
+            b=$(printf '%s\n' "$P" | FASTGGUF_BATCH=0 ./fastgguf chat t.gguf 1024 --temp 0 --max-tokens 24 | grep -a '^llama>')
+            echo "$q: $a"
+            [ -n "$a" ] && [ "$a" = "$b" ]
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: fastgguf-linux-x86_64

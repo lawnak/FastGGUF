@@ -46,6 +46,7 @@ NVIDIA, AMD or Intel graphics card through OpenCL when one is present.
 | **Fast CPU kernels** | Integer dot products with AVX2 / AVX-VNNI / AVX-512 VNNI, all cores via OpenMP. Works without AVX2 too (portable C path). |
 | **Mixture-of-Experts** | Qwen3 MoE models. Experts are read from disk only when the router picks them, so a model larger than your RAM can still run. |
 | **TurboQuant KV cache** | Optional compressed attention cache (`FASTGGUF_KV=turbo`): 5–9× less memory for long conversations, with a Hadamard rotation that keeps accuracy. |
+| **Batched prompt reading** | The message is processed in batches of up to 64 tokens, several times faster than token by token, with identical results. |
 | **Prompt cache reuse** | The server keeps the previous conversation in the KV cache and only processes the new part of each request. |
 | **Sampling controls** | temperature, top-k, top-p, repeat penalty, seed (reproducible replies), greedy mode. |
 | **Unicode everywhere** | Arabic, CJK and emoji are printed correctly, including on the Windows console and in file paths. |
@@ -251,8 +252,18 @@ Measured in a cloud VM: **Intel Xeon @ 2.8 GHz, 4 vCPUs (AVX-512), 15 GB RAM, no
   with one scale for the activations, like llama.cpp — about 1.2–1.7× faster generation for Q4_K_M files
   (Llama 3.2 1B: 11.8 → 20 tok/s). Integer kernels for Q5_0 / Q5_1 / Q4_1 made Gemma 3 1B and
   Qwen2.5 0.5B Q4_K_M files 4.5–5× faster (they store many weights as Q5_0).
-- **Reading long prompts is much slower than in llama.cpp** (about 7 vs 180 tokens/s for Llama 3.2 1B),
-  because fastgguf processes prompt tokens one by one instead of in batches.
+- **Reading the prompt** (the message you send, before the reply starts) now runs in batches of up to 64
+  tokens: each weight row is read once per batch and multiplied with 4 tokens at a time. That is
+  2.8–4× faster than before, but still about a third of llama.cpp's speed (512-token prompt, tokens/s):
+
+| Model (Q4_K_M) | token by token | **batched (now)** | llama.cpp |
+|---|---|---|---|
+| Llama 3.2 1B | 16.5 | **53.4** | 173.7 |
+| Gemma 3 1B | 16.2 | **64.8** | 136.6 |
+| Qwen2.5 1.5B | 13.4 | **38.5** | 127.3 |
+| Llama 3.2 3B | 6.2 | **18.3** | 61.5 |
+| Llama 3.1 8B | 3.1 | **8.6** | 25.2 |
+
 - A 4-core cloud VM is slow hardware; a recent desktop with more cores and faster memory should be several
   times faster (not measured here). Run `tools/bench.py` to get numbers for your own machine.
 - For reference, people read at roughly 5 tokens per second, so anything above that feels fluent.
@@ -273,8 +284,8 @@ common setups — real speed is always lower, and fastgguf is currently slower t
 | AMD RX 7800 XT 16 GB | 624 GB/s | ~310 tok/s | ~127 tok/s |
 | NVIDIA RTX 4090 24 GB | 1008 GB/s | ~500 tok/s | ~205 tok/s |
 
-Reading a prompt is not batched in fastgguf (tokens are processed one by one), so long
-prompts take about as long per token as generation.
+Reading the prompt is batched, so it runs several times faster per token than generation
+(see the prompt table above).
 
 ### TurboQuant: smaller KV cache for long contexts
 
@@ -369,6 +380,7 @@ system message and the latest message are always kept).
 | `FASTGGUF_KV` | `turbo`, `turbo8`, `turbo4`, `turbo2` | compressed KV cache (see above) |
 | `FASTGGUF_API_KEY` | any text | server requires `Authorization: Bearer <key>` |
 | `OMP_NUM_THREADS` | number | CPU threads (default: all) |
+| `FASTGGUF_BATCH` | `0` | read prompts token by token instead of in batches (same results, slower; for troubleshooting) |
 
 Windows example: `set FASTGGUF_KV=turbo` then `fastgguf.exe chat model.gguf 16384`.
 
@@ -409,8 +421,8 @@ real model's, because speed depends only on the sizes and weight types.
 
 ## Limitations
 
-- Prompts are processed one token at a time (no batched prompt processing), so very long
-  prompts are slower than in llama.cpp.
+- Prompt reading is batched but about 3× slower than llama.cpp; Gemma 4 models still read
+  prompts token by token.
 - Generation is 15–40 % slower than llama.cpp on CPU (see [Speed](#speed)): attention, normalization
   and activation rounding still run on one core. No ARM NEON kernels yet.
 - The server handles one request at a time.
