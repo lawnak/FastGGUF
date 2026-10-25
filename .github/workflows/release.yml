@@ -17,88 +17,75 @@ env:
   TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  # Windows: built on Windows with MSYS2 (its gcc has a static OpenMP library, so each .exe is
+  # self-contained), checked for DLL dependencies and self-tested on the same machine
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
     steps:
       - uses: actions/checkout@v4
-      - name: Install mingw-w64
-        timeout-minutes: 10
-        run: sudo apt-get update -q && sudo apt-get install -y -q gcc-mingw-w64-x86-64 zip
-
-      - name: Windows x64 (AVX2, recommended)
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: make zip mingw-w64-ucrt-x86_64-toolchain
+      - name: Build (AVX2 + compat)
         run: |
-          make portable OS=Windows_NT CC=x86_64-w64-mingw32-gcc
-          mkdir -p dist/win && mv *.exe dist/win/
-      - name: Windows x64 compat (any 64-bit CPU, slower)
-        run: |
-          make -B OS=Windows_NT CC=x86_64-w64-mingw32-gcc ARCH="-march=x86-64"
-          mkdir -p dist/win-compat && mv *.exe dist/win-compat/
-      - name: Linux x64 (AVX2)
-        run: |
+          set -e
           make portable
-          mkdir -p dist/linux && mv fastgguf fastgguf-server fastgguf-console dist/linux/
-          ./dist/linux/fastgguf selftest
-
+          mkdir -p dist/win && mv *.exe dist/win/
+          make -B ARCH="-march=x86-64"
+          mkdir -p dist/win-compat && mv *.exe dist/win-compat/
+      - name: No DLLs besides Windows' own, and self-test without MSYS2 on PATH
+        run: |
+          set -e
+          for d in win win-compat; do
+            for e in dist/$d/*.exe; do
+              if ldd "$e" | grep -iE '/ucrt64/|/mingw64/|/usr/bin/'; then echo "$e needs MSYS2 DLLs"; exit 1; fi
+            done
+            PATH=/c/Windows/System32:/c/Windows ./dist/$d/fastgguf.exe selftest
+          done
       - name: Package
         run: |
-          cat > dist/README.txt <<'EOF'
-          fastgguf - run GGUF language models locally
-
-          Windows:
-            1. Download a .gguf model (for example Qwen2.5 1.5B Instruct Q4_K_M from Hugging Face).
-            2. Drag the .gguf file onto chat.bat   -> chat in a terminal window
-               or drag it onto server.bat          -> web chat opens at http://localhost:8080
-            3. Optional check:  fastgguf.exe selftest
-
-          Commands:
-            fastgguf chat    model.gguf [ctx]
-            fastgguf serve   model.gguf [model2.gguf ...] [port] [ctx]
-            fastgguf inspect model.gguf
-            fastgguf gpu
-            fastgguf selftest
-
-          The "compat" build is for old CPUs without AVX2 (before 2013); it is much slower.
-          Full documentation: https://github.com/${{ github.repository }}
-          EOF
-          for d in win win-compat; do cp chat.bat server.bat dist/README.txt dist/$d/; done
-          cp run.sh dist/README.txt dist/linux/
-          cd dist
-          (cd win && zip -q -9 ../fastgguf-$TAG-windows-x64.zip *)
-          (cd win-compat && zip -q -9 ../fastgguf-$TAG-windows-x64-compat.zip *)
-          tar -C linux -czf fastgguf-$TAG-linux-x64.tar.gz .
-          ls -la
+          sed "s#REPO#${{ github.repository }}#" tools/release-readme.txt > README.txt
+          for d in win win-compat; do cp chat.bat server.bat README.txt dist/$d/; done
+          (cd dist/win && zip -q -9 ../fastgguf-$TAG-windows-x64.zip *)
+          (cd dist/win-compat && zip -q -9 ../fastgguf-$TAG-windows-x64-compat.zip *)
+          ls -la dist
       - uses: actions/upload-artifact@v4
         with:
-          name: release-files
-          path: |
-            dist/*.zip
-            dist/*.tar.gz
+          name: release-windows
+          path: dist/*.zip
 
-  test-windows:
-    needs: build
-    runs-on: windows-latest
+  build-linux:
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: release-files
-      - name: Test both Windows builds
-        shell: pwsh
+      - uses: actions/checkout@v4
+      - name: Build (AVX2) and self-test
         run: |
-          foreach ($z in Get-ChildItem *.zip) {
-            $d = $z.BaseName
-            Expand-Archive $z.FullName -DestinationPath $d
-            & "$d\fastgguf.exe" selftest
-            if ($LASTEXITCODE -ne 0) { throw "selftest failed in $d" }
-          }
+          make portable
+          ./fastgguf selftest
+      - name: Package
+        run: |
+          mkdir -p dist/linux
+          sed "s#REPO#${{ github.repository }}#" tools/release-readme.txt > dist/linux/README.txt
+          cp fastgguf fastgguf-server fastgguf-console run.sh dist/linux/
+          tar -C dist/linux -czf dist/fastgguf-$TAG-linux-x64.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: dist/*.tar.gz
 
   publish:
-    needs: [build, test-windows]
+    needs: [build-windows, build-linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: release-files
+          pattern: release-*
+          merge-multiple: true
           path: dist
       - name: Create or update the release
         env:
@@ -117,7 +104,7 @@ jobs:
           or \`server.bat\` (web chat at http://localhost:8080). No installation needed — static \`.exe\`,
           GPU (NVIDIA / AMD / Intel) used automatically through the graphics driver.
 
-          All binaries passed \`fastgguf selftest\` (Windows builds tested on a Windows runner).
+          All binaries passed \`fastgguf selftest\` (Windows builds were built and tested on Windows).
           See the [README](https://github.com/${{ github.repository }}#readme) for supported models and settings.
           EOF
           if gh release view "$TAG" >/dev/null 2>&1; then
