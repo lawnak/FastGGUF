@@ -1016,11 +1016,34 @@ static inline int k4_min_sum(const uint8_t sm[16], const q8k_blk_t *y) {
     return s;
 }
 
+#if defined(__AVX2__)
+// the same min term with vector instructions (it used to cost half the kernel time): the 16
+// per-16 sums are added in pairs with one hadd, then multiplied with the 8 mins → 4 int32 lanes
+static inline __m128i k4_min_vec(__m128i mins16, const q8k_blk_t *y) {
+    __m256i bs = _mm256_loadu_si256((const __m256i *)y->bsums);
+    __m128i q8s = _mm_hadd_epi16(_mm256_castsi256_si128(bs), _mm256_extracti128_si256(bs, 1));
+    return _mm_madd_epi16(mins16, q8s);
+}
+// Q6_K offset term Σ_g sc_g·Σy_g as 4 int32 lanes (sc16 = the 16 int8 scales widened to int16)
+static inline __m128i q6_corr_vec(__m256i sc16, const q8k_blk_t *y) {
+    __m256i v = _mm256_madd_epi16(sc16, _mm256_loadu_si256((const __m256i *)y->bsums));
+    return _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+}
+static inline float hsum128_ps(__m128 v) {
+    __m128 sh = _mm_movehdup_ps(v);
+    __m128 s = _mm_add_ps(v, sh);
+    sh = _mm_movehl_ps(sh, s);
+    s = _mm_add_ss(s, sh);
+    return _mm_cvtss_f32(s);
+}
+#endif
+
 static float dot_q4_K_q8k(const uint8_t *row, const q8k_blk_t *y, int nb) {
     float sum = 0.0f;
 #if defined(__AVX2__)
     const __m256i m4 = _mm256_set1_epi8(0x0F);
     __m256 acc = _mm256_setzero_ps();
+    __m128 macc = _mm_setzero_ps();
 #endif
     for (int b = 0; b < nb; b++) {
         const uint8_t *p = row + b * 144, *qs = p + 16;
@@ -1041,6 +1064,8 @@ static float dot_q4_K_q8k(const uint8_t *row, const q8k_blk_t *y, int nb) {
             sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(pl, ph));
         }
         acc = _mm256_fmadd_ps(_mm256_set1_ps(FP16(rd_u16(p)) * yd), _mm256_cvtepi32_ps(sumi), acc);
+        __m128i mins16 = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *)(sm + 8)));
+        macc = _mm_fmadd_ps(_mm_set1_ps(FP16(rd_u16(p + 2)) * yd), _mm_cvtepi32_ps(k4_min_vec(mins16, &y[b])), macc);
 #else
         int sumi = 0;
         for (int j = 0; j < 4; j++) {
@@ -1052,11 +1077,11 @@ static float dot_q4_K_q8k(const uint8_t *row, const q8k_blk_t *y, int nb) {
             sumi += sm[2 * j] * i1 + sm[2 * j + 1] * i2;
         }
         sum += FP16(rd_u16(p)) * yd * (float)sumi;
-#endif
         sum -= FP16(rd_u16(p + 2)) * yd * (float)k4_min_sum(sm, &y[b]);
+#endif
     }
 #if defined(__AVX2__)
-    sum += hsum_ps(acc);
+    sum = hsum_ps(acc) - hsum128_ps(macc);
 #endif
     return sum;
 }
@@ -1066,6 +1091,7 @@ static float dot_q5_K_q8k(const uint8_t *row, const q8k_blk_t *y, int nb) {
 #if defined(__AVX2__)
     const __m256i m4 = _mm256_set1_epi8(0x0F), one8 = _mm256_set1_epi8(1);
     __m256 acc = _mm256_setzero_ps();
+    __m128 macc = _mm_setzero_ps();
 #endif
     for (int b = 0; b < nb; b++) {
         const uint8_t *p = row + b * 176, *qh = p + 16, *ql = p + 48;
@@ -1091,6 +1117,8 @@ static float dot_q5_K_q8k(const uint8_t *row, const q8k_blk_t *y, int nb) {
             sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(pl, ph));
         }
         acc = _mm256_fmadd_ps(_mm256_set1_ps(FP16(rd_u16(p)) * yd), _mm256_cvtepi32_ps(sumi), acc);
+        __m128i mins16 = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *)(sm + 8)));
+        macc = _mm_fmadd_ps(_mm_set1_ps(FP16(rd_u16(p + 2)) * yd), _mm_cvtepi32_ps(k4_min_vec(mins16, &y[b])), macc);
 #else
         int sumi = 0;
         for (int j = 0; j < 4; j++) {
@@ -1103,11 +1131,11 @@ static float dot_q5_K_q8k(const uint8_t *row, const q8k_blk_t *y, int nb) {
             sumi += sm[2 * j] * i1 + sm[2 * j + 1] * i2;
         }
         sum += FP16(rd_u16(p)) * yd * (float)sumi;
-#endif
         sum -= FP16(rd_u16(p + 2)) * yd * (float)k4_min_sum(sm, &y[b]);
+#endif
     }
 #if defined(__AVX2__)
-    sum += hsum_ps(acc);
+    sum = hsum_ps(acc) - hsum128_ps(macc);
 #endif
     return sum;
 }
@@ -1117,13 +1145,12 @@ static float dot_q6_K_q8k(const uint8_t *row, const q8k_blk_t *y, int nb) {
 #if defined(__AVX2__)
     const __m256i m4 = _mm256_set1_epi8(0x0F), m3 = _mm256_set1_epi8(3);
     __m256 acc = _mm256_setzero_ps();
+    __m128 cacc = _mm_setzero_ps();        // Σ_g sc_g · Σy_g  (the -32 offset)
 #endif
     for (int b = 0; b < nb; b++) {
         const uint8_t *p = row + b * 210;
         const int8_t *sc = (const int8_t *)(p + 192);
         float dd = FP16(rd_u16(p + 208)) * y[b].d;
-        int corr = 0;                      // Σ_g sc_g · Σy_g  (the -32 offset)
-        for (int g = 0; g < 16; g++) corr += sc[g] * y[b].bsums[g];
 #if defined(__AVX2__)
         __m256i sumi = _mm256_setzero_si256();
         for (int half = 0; half < 2; half++) {
@@ -1150,8 +1177,11 @@ static float dot_q6_K_q8k(const uint8_t *row, const q8k_blk_t *y, int nb) {
             }
         }
         acc = _mm256_fmadd_ps(_mm256_set1_ps(dd), _mm256_cvtepi32_ps(sumi), acc);
-        sum -= dd * 32.0f * (float)corr;
+        __m256i sc16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)sc));
+        cacc = _mm_fmadd_ps(_mm_set1_ps(dd * 32.0f), _mm_cvtepi32_ps(q6_corr_vec(sc16, &y[b])), cacc);
 #else
+        int corr = 0;                      // Σ_g sc_g · Σy_g  (the -32 offset)
+        for (int g = 0; g < 16; g++) corr += sc[g] * y[b].bsums[g];
         int sumi = 0;
         for (int half = 0; half < 2; half++) {
             const uint8_t *ql = p + half * 64, *qh = p + 128 + half * 32;
@@ -1171,7 +1201,7 @@ static float dot_q6_K_q8k(const uint8_t *row, const q8k_blk_t *y, int nb) {
 #endif
     }
 #if defined(__AVX2__)
-    sum += hsum_ps(acc);
+    sum = hsum_ps(acc) - hsum128_ps(cacc);
 #endif
     return sum;
 }
@@ -1186,7 +1216,7 @@ static void dot_q4_K_q8k_x4(const uint8_t *row, const q8k_blk_t *const y[4], int
 #if defined(__AVX2__)
     const __m256i m4 = _mm256_set1_epi8(0x0F);
     __m256 acc[4] = { _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps() };
-    float mins[4] = { 0, 0, 0, 0 };
+    __m128 mac[4] = { _mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps() };
     for (int b = 0; b < nb; b++) {
         const uint8_t *p = row + b * 144, *qs = p + 16;
         uint8_t sm[16];
@@ -1206,13 +1236,14 @@ static void dot_q4_K_q8k_x4(const uint8_t *row, const q8k_blk_t *const y[4], int
 #undef Q4K_T
         }
         __m256i ss[4] = { s0, s1, s2, s3 };
+        __m128i mins16 = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *)(sm + 8)));
         for (int t = 0; t < 4; t++) {
             float yd = y[t][b].d;
             acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * yd), _mm256_cvtepi32_ps(ss[t]), acc[t]);
-            mins[t] += dmin * yd * (float)k4_min_sum(sm, &y[t][b]);
+            mac[t] = _mm_fmadd_ps(_mm_set1_ps(dmin * yd), _mm_cvtepi32_ps(k4_min_vec(mins16, &y[t][b])), mac[t]);
         }
     }
-    for (int t = 0; t < 4; t++) out[t] = hsum_ps(acc[t]) - mins[t];
+    for (int t = 0; t < 4; t++) out[t] = hsum_ps(acc[t]) - hsum128_ps(mac[t]);
 #else
     for (int t = 0; t < 4; t++) out[t] = dot_q4_K_q8k(row, y[t], nb);
 #endif
@@ -1222,7 +1253,7 @@ static void dot_q6_K_q8k_x4(const uint8_t *row, const q8k_blk_t *const y[4], int
 #if defined(__AVX2__)
     const __m256i m4 = _mm256_set1_epi8(0x0F), m3 = _mm256_set1_epi8(3);
     __m256 acc[4] = { _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps() };
-    float corr[4] = { 0, 0, 0, 0 };
+    __m128 cac[4] = { _mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps() };
     for (int b = 0; b < nb; b++) {
         const uint8_t *p = row + b * 210;
         const int8_t *sc = (const int8_t *)(p + 192);
@@ -1253,15 +1284,14 @@ static void dot_q6_K_q8k_x4(const uint8_t *row, const q8k_blk_t *const y[4], int
             }
         }
         __m256i ss[4] = { s0, s1, s2, s3 };
+        __m256i sc16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)sc));
         for (int t = 0; t < 4; t++) {
             float dd = d * y[t][b].d;
-            int c = 0;
-            for (int g = 0; g < 16; g++) c += sc[g] * y[t][b].bsums[g];
             acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(dd), _mm256_cvtepi32_ps(ss[t]), acc[t]);
-            corr[t] += dd * 32.0f * (float)c;
+            cac[t] = _mm_fmadd_ps(_mm_set1_ps(dd * 32.0f), _mm_cvtepi32_ps(q6_corr_vec(sc16, &y[t][b])), cac[t]);
         }
     }
-    for (int t = 0; t < 4; t++) out[t] = hsum_ps(acc[t]) - corr[t];
+    for (int t = 0; t < 4; t++) out[t] = hsum_ps(acc[t]) - hsum128_ps(cac[t]);
 #else
     for (int t = 0; t < 4; t++) out[t] = dot_q6_K_q8k(row, y[t], nb);
 #endif
@@ -2146,6 +2176,309 @@ static int matvec(tensor_t *t, const float *x, float *out) {
     return 0;
 }
 
+// =========================================================================
+// K-quant GEMM for prompt batches (Q4_K / Q6_K): the same idea as llama.cpp's tiled path.
+// Each weight row is unpacked once into plain bytes (0..15 or 0..63) plus one float scale per
+// group; the batch's activations are packed so that 4 consecutive values of V tokens sit side
+// by side. The inner loop is then one broadcast + one dpbusd (u8·s8 → 4 products summed into an
+// int32 lane, one lane per token) per 4 weights per V tokens. Scales are applied per group in
+// float, the min/offset term with the per-16 activation sums. Summation order differs from the
+// single-token kernels, so results match them up to float rounding.
+// =========================================================================
+
+#if defined(__AVX2__)
+#define GV 8                          // tokens per vector (8 int32 lanes)
+#define GT 4                          // vectors per microkernel call → 32 tokens
+static inline __m256i dp_u8s8(__m256i acc, __m256i a, __m256i b) {
+#if defined(__AVXVNNI__)
+    return _mm256_dpbusd_avx_epi32(acc, a, b);
+#elif defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    return _mm256_dpbusd_epi32(acc, a, b);
+#else   // a ≤ 63 and |b| ≤ 127: pairs stay below the int16 limit, no saturation
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), _mm256_set1_epi16(1)));
+#endif
+}
+
+// per-thread unpacked row: q[cols] bytes, wsc[cols/gsz] group scales, wmn[cols/msz] min terms
+static uint8_t **g_gq;
+static float **g_gsc, **g_gmn;
+// packed activations for the batch: values, per-(256-block) scale, per-min-group sums
+static int8_t *g_gpk;
+static float *g_gyd, *g_gbs;
+static int g_gemm_cols;
+
+static void gemm_alloc(int max_cols) {
+    if (max_cols <= g_gemm_cols) return;
+    int nt = omp_get_max_threads();
+    if (g_gq) {
+        for (int i = 0; i < nt; i++) { free(g_gq[i]); free(g_gsc[i]); free(g_gmn[i]); }
+        free(g_gq); free(g_gsc); free(g_gmn); free(g_gpk); free(g_gyd); free(g_gbs);
+    }
+    g_gemm_cols = max_cols;
+    g_gq = (uint8_t **)malloc(nt * sizeof(*g_gq));
+    g_gsc = (float **)malloc(nt * sizeof(*g_gsc));
+    g_gmn = (float **)malloc(nt * sizeof(*g_gmn));
+    for (int i = 0; i < nt; i++) {
+        g_gq[i] = (uint8_t *)malloc(2 * ((size_t)max_cols + 64));                // room for 2 rows
+        g_gsc[i] = (float *)malloc(2 * ((size_t)max_cols / 16 + 1) * sizeof(float));
+        g_gmn[i] = (float *)malloc(2 * ((size_t)max_cols / 16 + 1) * sizeof(float));
+    }
+    size_t tok = FG_BATCH + GV;   // room for padding to a whole vector
+    g_gpk = (int8_t *)malloc(tok * (size_t)max_cols + 64);
+    g_gyd = (float *)malloc(tok * ((size_t)max_cols / 256 + 1) * sizeof(float));
+    g_gbs = (float *)malloc(tok * ((size_t)max_cols / 16 + 1) * sizeof(float));
+}
+
+// Q4_K row → q (natural order), wsc per 32 (d·sc), wmn per 32 (dmin·m)
+static void unpack_row_q4_K(const uint8_t *row, int nb, uint8_t *q, float *wsc, float *wmn) {
+    const __m256i m4 = _mm256_set1_epi8(0x0F);
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *p = row + b * 144, *qs = p + 16;
+        uint8_t sm[16];
+        unpack_scales_k4(p + 4, sm);
+        float d = FP16(rd_u16(p)), dmin = FP16(rd_u16(p + 2));
+        for (int j = 0; j < 4; j++) {
+            __m256i v = _mm256_loadu_si256((const __m256i *)(qs + 32 * j));
+            _mm256_storeu_si256((__m256i *)(q + 256 * b + 64 * j), _mm256_and_si256(v, m4));
+            _mm256_storeu_si256((__m256i *)(q + 256 * b + 64 * j + 32), _mm256_and_si256(_mm256_srli_epi16(v, 4), m4));
+        }
+        for (int s = 0; s < 8; s++) { wsc[8 * b + s] = d * sm[s]; wmn[8 * b + s] = dmin * sm[8 + s]; }
+    }
+}
+
+// Q6_K row → q 0..63 (natural order), wsc per 16 (d·sc), wmn per 16 (32·d·sc, the -32 offset)
+static void unpack_row_q6_K(const uint8_t *row, int nb, uint8_t *q, float *wsc, float *wmn) {
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *p = row + b * 210;
+        const int8_t *sc = (const int8_t *)(p + 192);
+        float d = FP16(rd_u16(p + 208));
+        const __m256i m4 = _mm256_set1_epi8(0x0F), m3 = _mm256_set1_epi8(3);
+        for (int half = 0; half < 2; half++) {
+            const uint8_t *ql = p + half * 64, *qh = p + 128 + half * 32;
+            uint8_t *o = q + 256 * b + 128 * half;
+            __m256i a0 = _mm256_loadu_si256((const __m256i *)ql);
+            __m256i a1 = _mm256_loadu_si256((const __m256i *)(ql + 32));
+            __m256i hh = _mm256_loadu_si256((const __m256i *)qh);
+            _mm256_storeu_si256((__m256i *)o, _mm256_or_si256(_mm256_and_si256(a0, m4),
+                                _mm256_slli_epi16(_mm256_and_si256(hh, m3), 4)));
+            _mm256_storeu_si256((__m256i *)(o + 32), _mm256_or_si256(_mm256_and_si256(a1, m4),
+                                _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(hh, 2), m3), 4)));
+            _mm256_storeu_si256((__m256i *)(o + 64), _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(a0, 4), m4),
+                                _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(hh, 4), m3), 4)));
+            _mm256_storeu_si256((__m256i *)(o + 96), _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(a1, 4), m4),
+                                _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(hh, 6), m3), 4)));
+        }
+        for (int g = 0; g < 16; g++) { wsc[16 * b + g] = d * sc[g]; wmn[16 * b + g] = 32.0f * d * sc[g]; }
+    }
+}
+
+// pack the Q8_K activations of tokens 0..nb-1 (padded with zeros to a whole number of vectors)
+// msz = 32 (Q4_K mins) or 16 (Q6_K offsets): size of the groups whose activation sums are needed
+static void gemm_pack(const q8k_blk_t *xk, size_t sk, int nb, int cols, int msz) {
+    int nbl = cols / 256, nk4 = cols / 4, ng = cols / msz, nvec = (nb + GV - 1) / GV;
+    #pragma omp parallel for schedule(static)
+    for (int c = 0; c < nvec; c++) {
+        int32_t *dst = (int32_t *)(g_gpk + (size_t)c * nk4 * GV * 4);
+        for (int t = 0; t < GV; t++) {
+            int tok = c * GV + t;
+            const q8k_blk_t *y = tok < nb ? xk + (size_t)tok * sk : NULL;
+            for (int b = 0; b < nbl; b++) {
+                const int32_t *src = y ? (const int32_t *)y[b].qs : NULL;
+                for (int i = 0; i < 64; i++) dst[((size_t)b * 64 + i) * GV + t] = src ? src[i] : 0;
+                g_gyd[((size_t)c * nbl + b) * GV + t] = y ? y[b].d : 0.0f;
+                for (int g = 0; g < 256 / msz; g++) {
+                    int s = 0;
+                    if (y) for (int h = 0; h < msz / 16; h++) s += y[b].bsums[g * (msz / 16) + h];
+                    g_gbs[((size_t)c * ng + b * (256 / msz) + g) * GV + t] = (float)s;
+                }
+            }
+        }
+    }
+}
+
+// one weight row × GT vectors of tokens (starting at vector c0) → Y[(token)·ldy + r]
+// gsz = group size of the scales (32 Q4_K / 16 Q6_K), msz = group size of the min terms
+static void gemm_row_x4(const uint8_t *q, const float *wsc, const float *wmn, int cols, int gsz, int msz,
+                        int c0, float *Y, int ldy, int64_t r, int nb) {
+    int nbl = cols / 256, nk4 = cols / 4, ng = cols / msz;
+    __m256 f0 = _mm256_setzero_ps(), f1 = f0, f2 = f0, f3 = f0;
+    const int8_t *B0 = g_gpk + (size_t)(c0 + 0) * nk4 * GV * 4, *B1 = g_gpk + (size_t)(c0 + 1) * nk4 * GV * 4;
+    const int8_t *B2 = g_gpk + (size_t)(c0 + 2) * nk4 * GV * 4, *B3 = g_gpk + (size_t)(c0 + 3) * nk4 * GV * 4;
+    for (int b = 0; b < nbl; b++) {
+        __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+        for (int g = 0; g < 256 / gsz; g++) {
+            __m256i i0 = _mm256_setzero_si256(), i1 = i0, i2 = i0, i3 = i0;
+            int k0 = 256 * b + gsz * g;
+            const uint8_t *qa = q + k0;
+            size_t o = (size_t)k0 * GV;              // packed: 4 values × GV tokens per 4 weights
+            for (int s = 0; s < gsz / 4; s++, qa += 4, o += 4 * GV) {
+                int32_t w4; memcpy(&w4, qa, 4);
+                __m256i a = _mm256_set1_epi32(w4);
+                i0 = dp_u8s8(i0, a, _mm256_loadu_si256((const __m256i *)(B0 + o)));
+                i1 = dp_u8s8(i1, a, _mm256_loadu_si256((const __m256i *)(B1 + o)));
+                i2 = dp_u8s8(i2, a, _mm256_loadu_si256((const __m256i *)(B2 + o)));
+                i3 = dp_u8s8(i3, a, _mm256_loadu_si256((const __m256i *)(B3 + o)));
+            }
+            __m256 ws = _mm256_set1_ps(wsc[k0 / gsz]);
+            a0 = _mm256_fmadd_ps(ws, _mm256_cvtepi32_ps(i0), a0);
+            a1 = _mm256_fmadd_ps(ws, _mm256_cvtepi32_ps(i1), a1);
+            a2 = _mm256_fmadd_ps(ws, _mm256_cvtepi32_ps(i2), a2);
+            a3 = _mm256_fmadd_ps(ws, _mm256_cvtepi32_ps(i3), a3);
+        }
+        for (int g = 0; g < 256 / msz; g++) {        // min / offset term: Σ_g wmn_g · Σy_g
+            int gi = b * (256 / msz) + g;
+            __m256 wm = _mm256_set1_ps(wmn[gi]);
+            a0 = _mm256_fnmadd_ps(wm, _mm256_loadu_ps(g_gbs + ((size_t)(c0 + 0) * ng + gi) * GV), a0);
+            a1 = _mm256_fnmadd_ps(wm, _mm256_loadu_ps(g_gbs + ((size_t)(c0 + 1) * ng + gi) * GV), a1);
+            a2 = _mm256_fnmadd_ps(wm, _mm256_loadu_ps(g_gbs + ((size_t)(c0 + 2) * ng + gi) * GV), a2);
+            a3 = _mm256_fnmadd_ps(wm, _mm256_loadu_ps(g_gbs + ((size_t)(c0 + 3) * ng + gi) * GV), a3);
+        }
+        f0 = _mm256_fmadd_ps(a0, _mm256_loadu_ps(g_gyd + ((size_t)(c0 + 0) * nbl + b) * GV), f0);
+        f1 = _mm256_fmadd_ps(a1, _mm256_loadu_ps(g_gyd + ((size_t)(c0 + 1) * nbl + b) * GV), f1);
+        f2 = _mm256_fmadd_ps(a2, _mm256_loadu_ps(g_gyd + ((size_t)(c0 + 2) * nbl + b) * GV), f2);
+        f3 = _mm256_fmadd_ps(a3, _mm256_loadu_ps(g_gyd + ((size_t)(c0 + 3) * nbl + b) * GV), f3);
+    }
+    float o[4 * GV];
+    _mm256_storeu_ps(o, f0); _mm256_storeu_ps(o + GV, f1); _mm256_storeu_ps(o + 2 * GV, f2); _mm256_storeu_ps(o + 3 * GV, f3);
+    for (int i = 0; i < 4 * GV; i++) {
+        int tok = c0 * GV + i;
+        if (tok < nb) Y[(size_t)tok * ldy + r] = o[i];
+    }
+}
+
+#if defined(__AVX512VL__)
+// two weight rows × GT vectors: 8 independent dpbusd chains share each load of the activations
+// (24 accumulator registers: only with AVX-512's 32 vector registers)
+static void gemm_row2_x4(const uint8_t *qA, const float *scA, const float *mnA,
+                         const uint8_t *qB, const float *scB, const float *mnB,
+                         int cols, int gsz, int msz, int c0, float *Y, int ldy, int64_t r, int nb) {
+    int nbl = cols / 256, nk4 = cols / 4, ng = cols / msz;
+    const int8_t *P0 = g_gpk + (size_t)(c0 + 0) * nk4 * GV * 4, *P1 = g_gpk + (size_t)(c0 + 1) * nk4 * GV * 4;
+    const int8_t *P2 = g_gpk + (size_t)(c0 + 2) * nk4 * GV * 4, *P3 = g_gpk + (size_t)(c0 + 3) * nk4 * GV * 4;
+    __m256 fA0 = _mm256_setzero_ps(), fA1 = fA0, fA2 = fA0, fA3 = fA0, fB0 = fA0, fB1 = fA0, fB2 = fA0, fB3 = fA0;
+    for (int b = 0; b < nbl; b++) {
+        __m256 aA0 = _mm256_setzero_ps(), aA1 = aA0, aA2 = aA0, aA3 = aA0, aB0 = aA0, aB1 = aA0, aB2 = aA0, aB3 = aA0;
+        for (int g = 0; g < 256 / gsz; g++) {
+            __m256i iA0 = _mm256_setzero_si256(), iA1 = iA0, iA2 = iA0, iA3 = iA0;
+            __m256i iB0 = iA0, iB1 = iA0, iB2 = iA0, iB3 = iA0;
+            int k0 = 256 * b + gsz * g;
+            const uint8_t *qa = qA + k0, *qb = qB + k0;
+            size_t o = (size_t)k0 * GV;
+            for (int s = 0; s < gsz / 4; s++, qa += 4, qb += 4, o += 4 * GV) {
+                int32_t wa, wb; memcpy(&wa, qa, 4); memcpy(&wb, qb, 4);
+                __m256i va = _mm256_set1_epi32(wa), vb = _mm256_set1_epi32(wb);
+                __m256i x0 = _mm256_loadu_si256((const __m256i *)(P0 + o)), x1 = _mm256_loadu_si256((const __m256i *)(P1 + o));
+                __m256i x2 = _mm256_loadu_si256((const __m256i *)(P2 + o)), x3 = _mm256_loadu_si256((const __m256i *)(P3 + o));
+                iA0 = dp_u8s8(iA0, va, x0); iA1 = dp_u8s8(iA1, va, x1); iA2 = dp_u8s8(iA2, va, x2); iA3 = dp_u8s8(iA3, va, x3);
+                iB0 = dp_u8s8(iB0, vb, x0); iB1 = dp_u8s8(iB1, vb, x1); iB2 = dp_u8s8(iB2, vb, x2); iB3 = dp_u8s8(iB3, vb, x3);
+            }
+            __m256 wa = _mm256_set1_ps(scA[k0 / gsz]), wb = _mm256_set1_ps(scB[k0 / gsz]);
+            aA0 = _mm256_fmadd_ps(wa, _mm256_cvtepi32_ps(iA0), aA0); aA1 = _mm256_fmadd_ps(wa, _mm256_cvtepi32_ps(iA1), aA1);
+            aA2 = _mm256_fmadd_ps(wa, _mm256_cvtepi32_ps(iA2), aA2); aA3 = _mm256_fmadd_ps(wa, _mm256_cvtepi32_ps(iA3), aA3);
+            aB0 = _mm256_fmadd_ps(wb, _mm256_cvtepi32_ps(iB0), aB0); aB1 = _mm256_fmadd_ps(wb, _mm256_cvtepi32_ps(iB1), aB1);
+            aB2 = _mm256_fmadd_ps(wb, _mm256_cvtepi32_ps(iB2), aB2); aB3 = _mm256_fmadd_ps(wb, _mm256_cvtepi32_ps(iB3), aB3);
+        }
+        for (int g = 0; g < 256 / msz; g++) {
+            int gi = b * (256 / msz) + g;
+            __m256 ma = _mm256_set1_ps(mnA[gi]), mb = _mm256_set1_ps(mnB[gi]);
+            __m256 s0 = _mm256_loadu_ps(g_gbs + ((size_t)(c0 + 0) * ng + gi) * GV), s1 = _mm256_loadu_ps(g_gbs + ((size_t)(c0 + 1) * ng + gi) * GV);
+            __m256 s2 = _mm256_loadu_ps(g_gbs + ((size_t)(c0 + 2) * ng + gi) * GV), s3 = _mm256_loadu_ps(g_gbs + ((size_t)(c0 + 3) * ng + gi) * GV);
+            aA0 = _mm256_fnmadd_ps(ma, s0, aA0); aA1 = _mm256_fnmadd_ps(ma, s1, aA1); aA2 = _mm256_fnmadd_ps(ma, s2, aA2); aA3 = _mm256_fnmadd_ps(ma, s3, aA3);
+            aB0 = _mm256_fnmadd_ps(mb, s0, aB0); aB1 = _mm256_fnmadd_ps(mb, s1, aB1); aB2 = _mm256_fnmadd_ps(mb, s2, aB2); aB3 = _mm256_fnmadd_ps(mb, s3, aB3);
+        }
+        __m256 y0 = _mm256_loadu_ps(g_gyd + ((size_t)(c0 + 0) * nbl + b) * GV), y1 = _mm256_loadu_ps(g_gyd + ((size_t)(c0 + 1) * nbl + b) * GV);
+        __m256 y2 = _mm256_loadu_ps(g_gyd + ((size_t)(c0 + 2) * nbl + b) * GV), y3 = _mm256_loadu_ps(g_gyd + ((size_t)(c0 + 3) * nbl + b) * GV);
+        fA0 = _mm256_fmadd_ps(aA0, y0, fA0); fA1 = _mm256_fmadd_ps(aA1, y1, fA1); fA2 = _mm256_fmadd_ps(aA2, y2, fA2); fA3 = _mm256_fmadd_ps(aA3, y3, fA3);
+        fB0 = _mm256_fmadd_ps(aB0, y0, fB0); fB1 = _mm256_fmadd_ps(aB1, y1, fB1); fB2 = _mm256_fmadd_ps(aB2, y2, fB2); fB3 = _mm256_fmadd_ps(aB3, y3, fB3);
+    }
+    float oA[4 * GV], oB[4 * GV];
+    _mm256_storeu_ps(oA, fA0); _mm256_storeu_ps(oA + GV, fA1); _mm256_storeu_ps(oA + 2 * GV, fA2); _mm256_storeu_ps(oA + 3 * GV, fA3);
+    _mm256_storeu_ps(oB, fB0); _mm256_storeu_ps(oB + GV, fB1); _mm256_storeu_ps(oB + 2 * GV, fB2); _mm256_storeu_ps(oB + 3 * GV, fB3);
+    for (int i = 0; i < 4 * GV; i++) {
+        int tok = c0 * GV + i;
+        if (tok < nb) { Y[(size_t)tok * ldy + r] = oA[i]; Y[(size_t)tok * ldy + r + 1] = oB[i]; }
+    }
+}
+#endif
+
+// the same for a single vector of tokens (the remainder when the batch is not a multiple of 32)
+static void gemm_row_x1(const uint8_t *q, const float *wsc, const float *wmn, int cols, int gsz, int msz,
+                        int c0, float *Y, int ldy, int64_t r, int nb) {
+    int nbl = cols / 256, nk4 = cols / 4, ng = cols / msz;
+    __m256 f0 = _mm256_setzero_ps();
+    const int8_t *B0 = g_gpk + (size_t)c0 * nk4 * GV * 4;
+    for (int b = 0; b < nbl; b++) {
+        __m256 a0 = _mm256_setzero_ps();
+        for (int g = 0; g < 256 / gsz; g++) {
+            __m256i i0 = _mm256_setzero_si256();
+            int k0 = 256 * b + gsz * g;
+            const uint8_t *qa = q + k0;
+            size_t o = (size_t)k0 * GV;
+            for (int s = 0; s < gsz / 4; s++, qa += 4, o += 4 * GV) {
+                int32_t w4; memcpy(&w4, qa, 4);
+                i0 = dp_u8s8(i0, _mm256_set1_epi32(w4), _mm256_loadu_si256((const __m256i *)(B0 + o)));
+            }
+            a0 = _mm256_fmadd_ps(_mm256_set1_ps(wsc[k0 / gsz]), _mm256_cvtepi32_ps(i0), a0);
+        }
+        for (int g = 0; g < 256 / msz; g++) {
+            int gi = b * (256 / msz) + g;
+            a0 = _mm256_fnmadd_ps(_mm256_set1_ps(wmn[gi]), _mm256_loadu_ps(g_gbs + ((size_t)c0 * ng + gi) * GV), a0);
+        }
+        f0 = _mm256_fmadd_ps(a0, _mm256_loadu_ps(g_gyd + ((size_t)c0 * nbl + b) * GV), f0);
+    }
+    float o[GV];
+    _mm256_storeu_ps(o, f0);
+    for (int i = 0; i < GV; i++) {
+        int tok = c0 * GV + i;
+        if (tok < nb) Y[(size_t)tok * ldy + r] = o[i];
+    }
+}
+
+// Y = W · X for a Q4_K / Q6_K weight and nb ≥ GV tokens already quantized to Q8_K (xk, stride sk)
+static void gemm_kquant(tensor_t *t, int cols, int64_t rows, const q8k_blk_t *xk, size_t sk,
+                        float *Y, int ldy, int nb) {
+    int q6 = t->type == T_Q6_K;
+    int gsz = q6 ? 16 : 32, msz = q6 ? 16 : 32, nbl = cols / 256;
+    uint64_t stride = row_stride(t->type, (uint64_t)cols);
+    gemm_alloc(g_max_cols);
+    gemm_pack(xk, sk, nb, cols, msz);
+    int nvec = (nb + GV - 1) / GV;
+#if defined(__AVX512VL__)
+    const int RP = 2;                   // rows per step (2-row kernel)
+#else
+    const int RP = 1;
+#endif
+    size_t qoff = (size_t)g_gemm_cols + 64, soff = (size_t)g_gemm_cols / 16 + 1;
+    int64_t nsteps = (rows + RP - 1) / RP;
+    #pragma omp parallel for schedule(static)
+    for (int64_t st = 0; st < nsteps; st++) {
+        int th = omp_get_thread_num();
+        int64_t r = st * RP;
+        int two = RP == 2 && r + 1 < rows;
+        for (int k = 0; k <= two; k++) {
+            const uint8_t *rb = t->data + (uint64_t)(r + k) * stride;
+            if (q6) unpack_row_q6_K(rb, nbl, g_gq[th] + k * qoff, g_gsc[th] + k * soff, g_gmn[th] + k * soff);
+            else    unpack_row_q4_K(rb, nbl, g_gq[th] + k * qoff, g_gsc[th] + k * soff, g_gmn[th] + k * soff);
+        }
+        const uint8_t *q = g_gq[th];
+        const float *wsc = g_gsc[th], *wmn = g_gmn[th];
+        int c = 0;
+#if defined(__AVX512VL__)
+        if (two)
+            for (; c + GT <= nvec; c += GT)
+                gemm_row2_x4(q, wsc, wmn, q + qoff, wsc + soff, wmn + soff, cols, gsz, msz, c, Y, ldy, r, nb);
+#endif
+        for (int k = 0; k <= two; k++) {
+            int cc = c;
+            for (; cc + GT <= nvec; cc += GT)
+                gemm_row_x4(q + k * qoff, wsc + k * soff, wmn + k * soff, cols, gsz, msz, cc, Y, ldy, r + k, nb);
+            for (; cc < nvec; cc++)
+                gemm_row_x1(q + k * qoff, wsc + k * soff, wmn + k * soff, cols, gsz, msz, cc, Y, ldy, r + k, nb);
+        }
+    }
+}
+#endif
+
 // Y[b·ldy + r] = dot(W[r], X[b·ldx ...]) for b < nb (nb ≤ FG_BATCH) — each weight row is loaded once
 // and multiplied with all nb inputs while it is still in cache (prompt processing)
 static int matmul(tensor_t *t, const float *X, int ldx, float *Y, int ldy, int nb) {
@@ -2165,41 +2498,67 @@ static int matmul(tensor_t *t, const float *X, int ldx, float *Y, int ldy, int n
     #pragma omp parallel for schedule(static)
     for (int b = 0; b < nb; b++)
         quantize_act(kind, X + (size_t)b * ldx, g_bxq8 + b * s8, g_bxq8k + b * sk, cols);
+#if defined(__AVX2__)
+    // Q4_K / Q6_K with a real batch: unpack each row once, int8 GEMM with dpbusd
+    if (kind == ACT_Q8K && (t->type == T_Q4_K || t->type == T_Q6_K) && nb >= GV) {
+        gemm_kquant(t, cols, rows, g_bxq8k, sk, Y, ldy, nb);
+        return 0;
+    }
+#endif
     // no integer kernel: dequantize the row once, then plain float dots with every input
     int deq = kind == ACT_F32 && t->type != T_F32 && t->type != T_F16 && t->type != T_BF16;
     int fail = 0;
-    #pragma omp parallel for schedule(static)
-    for (int64_t r = 0; r < rows; r++) {
-        const uint8_t *rb = raw + (uint64_t)r * stride;
-        if (deq) {
+    if (deq) {
+        #pragma omp parallel for schedule(static)
+        for (int64_t r = 0; r < rows; r++) {
             float *scr = g_scratch[omp_get_thread_num()];
-            if (dequantize_row(t->type, rb, scr, cols) != 0) { fail = 1; continue; }
+            if (dequantize_row(t->type, raw + (uint64_t)r * stride, scr, cols) != 0) { fail = 1; continue; }
             for (int b = 0; b < nb; b++)
                 Y[(size_t)b * ldy + r] = dot_f32v(scr, X + (size_t)b * ldx, cols);
-        } else {
-            int b = 0;
-            // groups of 4 inputs share one unpacking of the weight row
-            if (kind == ACT_Q8K && (t->type == T_Q4_K || t->type == T_Q6_K)) {
-                for (; b + 4 <= nb; b += 4) {
-                    const q8k_blk_t *yk[4] = { g_bxq8k + b * sk, g_bxq8k + (b + 1) * sk,
-                                               g_bxq8k + (b + 2) * sk, g_bxq8k + (b + 3) * sk };
-                    float o[4];
-                    if (t->type == T_Q4_K) dot_q4_K_q8k_x4(rb, yk, cols / 256, o);
-                    else                   dot_q6_K_q8k_x4(rb, yk, cols / 256, o);
-                    for (int i = 0; i < 4; i++) Y[(size_t)(b + i) * ldy + r] = o[i];
-                }
-            } else if (kind == ACT_Q8 && (t->type == T_Q8_0 || t->type == T_Q4_0 || t->type == T_Q5_0)) {
-                for (; b + 4 <= nb; b += 4) {
-                    const q8_blk_t *yq[4] = { g_bxq8 + b * s8, g_bxq8 + (b + 1) * s8,
-                                              g_bxq8 + (b + 2) * s8, g_bxq8 + (b + 3) * s8 };
-                    float o[4];
-                    dot_q32_q8_x4(t->type, rb, yq, cols / 32, o);
-                    for (int i = 0; i < 4; i++) Y[(size_t)(b + i) * ldy + r] = o[i];
+        }
+    } else {
+        // tiles: a block of rows × a group of inputs small enough to stay in L1, so every input is
+        // loaded from cache once per row block instead of once per row
+        int x4k = kind == ACT_Q8K && (t->type == T_Q4_K || t->type == T_Q6_K);
+        int x4q = kind == ACT_Q8 && (t->type == T_Q8_0 || t->type == T_Q4_0 || t->type == T_Q5_0);
+        size_t abytes = kind == ACT_Q8K ? (size_t)(cols / 256) * sizeof(q8k_blk_t)
+                                        : (size_t)(cols / 32) * sizeof(q8_blk_t);
+        int TT = (int)((24 * 1024) / (abytes ? abytes : 1)) & ~3;
+        if (TT < 4) TT = 4;
+        if (TT > nb) TT = nb;
+        const int RB = 16;
+        int64_t nblk = (rows + RB - 1) / RB;
+        #pragma omp parallel for schedule(static)
+        for (int64_t blk = 0; blk < nblk; blk++) {
+            int64_t r0 = blk * RB, r1 = r0 + RB < rows ? r0 + RB : rows;
+            for (int b0 = 0; b0 < nb; b0 += TT) {
+                int b1 = b0 + TT < nb ? b0 + TT : nb;
+                for (int64_t r = r0; r < r1; r++) {
+                    const uint8_t *rb = raw + (uint64_t)r * stride;
+                    int b = b0;
+                    if (x4k) {          // groups of 4 inputs share one unpacking of the weight row
+                        for (; b + 4 <= b1; b += 4) {
+                            const q8k_blk_t *yk[4] = { g_bxq8k + b * sk, g_bxq8k + (b + 1) * sk,
+                                                       g_bxq8k + (b + 2) * sk, g_bxq8k + (b + 3) * sk };
+                            float o[4];
+                            if (t->type == T_Q4_K) dot_q4_K_q8k_x4(rb, yk, cols / 256, o);
+                            else                   dot_q6_K_q8k_x4(rb, yk, cols / 256, o);
+                            for (int i = 0; i < 4; i++) Y[(size_t)(b + i) * ldy + r] = o[i];
+                        }
+                    } else if (x4q) {
+                        for (; b + 4 <= b1; b += 4) {
+                            const q8_blk_t *yq[4] = { g_bxq8 + b * s8, g_bxq8 + (b + 1) * s8,
+                                                      g_bxq8 + (b + 2) * s8, g_bxq8 + (b + 3) * s8 };
+                            float o[4];
+                            dot_q32_q8_x4(t->type, rb, yq, cols / 32, o);
+                            for (int i = 0; i < 4; i++) Y[(size_t)(b + i) * ldy + r] = o[i];
+                        }
+                    }
+                    for (; b < b1; b++)
+                        Y[(size_t)b * ldy + r] = dot_row(t->type, kind, rb, g_bxq8 + b * s8, g_bxq8k + b * sk,
+                                                         X + (size_t)b * ldx, cols, &fail);
                 }
             }
-            for (; b < nb; b++)
-                Y[(size_t)b * ldy + r] = dot_row(t->type, kind, rb, g_bxq8 + b * s8, g_bxq8k + b * sk,
-                                                 X + (size_t)b * ldx, cols, &fail);
         }
     }
     if (fail) {
@@ -4568,6 +4927,50 @@ static int cmd_selftest(void) {
     fails += test_kquant("Q4_K", T_Q4_K, 144, dot_q4_K_q8k);
     fails += test_kquant("Q5_K", T_Q5_K, 176, dot_q5_K_q8k);
     fails += test_kquant("Q6_K", T_Q6_K, 210, dot_q6_K_q8k);
+
+    // --- prompt-batch GEMM (Q4_K / Q6_K): matmul() against the single-input kernel on the same
+    //     Q8_K inputs; odd row count and a batch that is not a multiple of 32 exercise every path
+    {
+        int cols = 512, rows = 37, nbt = 45;
+        matvec_init_scratch(cols);
+        static const struct { uint32_t type; const char *name; int bytes; } gt[2] = {
+            { T_Q4_K, "Q4_K", 144 }, { T_Q6_K, "Q6_K", 210 } };
+        float *X = (float *)malloc((size_t)nbt * cols * sizeof(float));
+        float *Y = (float *)malloc((size_t)nbt * rows * sizeof(float));
+        for (int i = 0; i < nbt * cols; i++) X[i] = (float)(rand() % 2000 - 1000) / 500.0f;
+        for (int k = 0; k < 2; k++) {
+            size_t rbytes = (size_t)(cols / 256) * gt[k].bytes;
+            uint8_t *w = (uint8_t *)malloc(rbytes * rows);
+            for (size_t i = 0; i < rbytes * rows; i++) w[i] = (uint8_t)(rand() & 0xFF);
+            for (int b = 0; b < rows * (cols / 256); b++) {
+                uint8_t *p = w + (size_t)b * gt[k].bytes;
+                uint16_t h = (uint16_t)(0x2C00 + (rand() & 0x3FF)), h2 = (uint16_t)(0x2400 + (rand() & 0x3FF));
+                if (gt[k].type == T_Q6_K) memcpy(p + 208, &h, 2);
+                else { memcpy(p, &h, 2); memcpy(p + 2, &h2, 2); }
+            }
+            tensor_t t;
+            memset(&t, 0, sizeof(t));
+            snprintf(t.name, sizeof(t.name), "selftest.%s", gt[k].name);
+            t.type = gt[k].type; t.n_dims = 2; t.ne[0] = cols; t.ne[1] = rows; t.data = w; t.nbytes = rbytes * rows;
+            matmul(&t, X, cols, Y, rows, nbt);
+            size_t sk = (size_t)g_max_cols / 256 + 1;
+            double emax = 0, ymax = 0;
+            for (int b = 0; b < nbt; b++)
+                for (int r = 0; r < rows; r++) {
+                    const uint8_t *rb = w + (size_t)r * rbytes;
+                    float ref = gt[k].type == T_Q4_K ? dot_q4_K_q8k(rb, g_bxq8k + b * sk, cols / 256)
+                                                     : dot_q6_K_q8k(rb, g_bxq8k + b * sk, cols / 256);
+                    double e = fabs(ref - Y[(size_t)b * rows + r]);
+                    if (e > emax) emax = e;
+                    if (fabs(ref) > ymax) ymax = fabs(ref);
+                }
+            double rel = emax / (ymax + 1e-9);
+            printf("%-5s batch GEMM vs single kernel: rel_err=%.2e %s\n", gt[k].name, rel, rel < 1e-5 ? "OK" : "FAIL");
+            if (rel >= 1e-5) fails++;
+            free(w);
+        }
+        free(X); free(Y);
+    }
 
     // --- 4-input kernels (prompt batches) must equal 4 single-input calls ---
     {

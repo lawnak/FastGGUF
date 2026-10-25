@@ -46,7 +46,7 @@ NVIDIA, AMD or Intel graphics card through OpenCL when one is present.
 | **Fast CPU kernels** | Integer dot products with AVX2 / AVX-VNNI / AVX-512 VNNI, all cores via OpenMP. Works without AVX2 too (portable C path). |
 | **Mixture-of-Experts** | Qwen3 MoE models. Experts are read from disk only when the router picks them, so a model larger than your RAM can still run. |
 | **TurboQuant KV cache** | Optional compressed attention cache (`FASTGGUF_KV=turbo`): 5–9× less memory for long conversations, with a Hadamard rotation that keeps accuracy. |
-| **Batched prompt reading** | The message is processed in batches of up to 64 tokens, several times faster than token by token, with identical results. |
+| **Batched prompt reading** | The message is processed in batches of up to 64 tokens with an int8 matrix-multiply (VNNI where available), 6–8× faster than token by token; results agree with token-by-token up to float rounding. |
 | **Prompt cache reuse** | The server keeps the previous conversation in the KV cache and only processes the new part of each request. |
 | **Sampling controls** | temperature, top-k, top-p, repeat penalty, seed (reproducible replies), greedy mode. |
 | **Unicode everywhere** | Arabic, CJK and emoji are printed correctly, including on the Windows console and in file paths. |
@@ -262,17 +262,21 @@ Measured in a cloud VM: **Intel Xeon @ 2.8 GHz, 4 vCPUs (AVX-512), 15 GB RAM, no
   with one scale for the activations, like llama.cpp — about 1.2–1.7× faster generation for Q4_K_M files
   (Llama 3.2 1B: 11.8 → 20 tok/s). Integer kernels for Q5_0 / Q5_1 / Q4_1 made Gemma 3 1B and
   Qwen2.5 0.5B Q4_K_M files 4.5–5× faster (they store many weights as Q5_0).
-- **Reading the prompt** (the message you send, before the reply starts) now runs in batches of up to 64
-  tokens: each weight row is read once per batch and multiplied with 4 tokens at a time. That is
-  2.8–4× faster than before, but still about a third of llama.cpp's speed (512-token prompt, tokens/s):
+- **Reading the prompt** (the message you send, before the reply starts) runs in batches of up to 64
+  tokens. For Q4_K / Q6_K weights each row is unpacked once into plain bytes and multiplied with 32
+  tokens at a time using `dpbusd` (one instruction = 32 int8 multiply-adds; AVX-VNNI / AVX-512 VNNI,
+  with an AVX2 fallback), the same approach as llama.cpp's tiled CPU path. 512-token prompt, tokens/s:
 
-| Model (Q4_K_M) | token by token | **batched (now)** | llama.cpp |
-|---|---|---|---|
-| Llama 3.2 1B | 16.5 | **53.4** | 173.7 |
-| Gemma 3 1B | 16.2 | **64.8** | 136.6 |
-| Qwen2.5 1.5B | 13.4 | **38.5** | 127.3 |
-| Llama 3.2 3B | 6.2 | **18.3** | 61.5 |
-| Llama 3.1 8B | 3.1 | **8.6** | 25.2 |
+| Model (Q4_K_M) | token by token | v0.5.0 (batched) | **now** | llama.cpp |
+|---|---|---|---|---|
+| Llama 3.2 1B | 16.5 | 64.9 | **133.7** | 173.7 |
+| Qwen2.5 1.5B | 13.4 | 43.7 | **100.7** | 127.3 |
+| Gemma 3 1B | 16.2 | 73.4 | **92.5** | 136.6 |
+| Llama 3.2 3B | 6.2 | 21.7 | **48.5** | 61.5 |
+| Llama 3.1 8B | 3.1 | 8.4 | **18.3** | 25.2 |
+
+  Gemma 3 1B gains less because its Q4_K_M file also stores many weights as Q5_0 / Q8_0
+  (layer width 1152), which still use the older 4-token kernel.
 
 - A 4-core cloud VM is slow hardware; a recent desktop with more cores and faster memory should be several
   times faster (not measured here). Run `tools/bench.py` to get numbers for your own machine.
@@ -390,7 +394,7 @@ system message and the latest message are always kept).
 | `FASTGGUF_KV` | `turbo`, `turbo8`, `turbo4`, `turbo2` | compressed KV cache (see above) |
 | `FASTGGUF_API_KEY` | any text | server requires `Authorization: Bearer <key>` |
 | `OMP_NUM_THREADS` | number | CPU threads (default: all) |
-| `FASTGGUF_BATCH` | `0` | read prompts token by token instead of in batches (same results, slower; for troubleshooting) |
+| `FASTGGUF_BATCH` | `0` | read prompts token by token instead of in batches (same results up to float rounding, much slower; for troubleshooting) |
 
 Windows example: `set FASTGGUF_KV=turbo` then `fastgguf.exe chat model.gguf 16384`.
 
@@ -431,8 +435,8 @@ real model's, because speed depends only on the sizes and weight types.
 
 ## Limitations
 
-- Prompt reading is batched but about 3× slower than llama.cpp; Gemma 4 models still read
-  prompts token by token.
+- Prompt reading reaches about 70–80 % of llama.cpp's speed for Q4_K_M files (less for files with
+  many Q5_0 / Q8_0 weights); Gemma 4 models still read prompts token by token.
 - Generation with a short context is 15–40 % slower than llama.cpp on CPU (see [Speed](#speed));
   with long contexts the two are close. No ARM NEON kernels yet.
 - The server handles one request at a time.
