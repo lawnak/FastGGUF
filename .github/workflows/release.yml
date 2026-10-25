@@ -22,6 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install mingw-w64
+        timeout-minutes: 10
         run: sudo apt-get update -q && sudo apt-get install -y -q gcc-mingw-w64-x86-64 zip
 
       - name: Windows x64 (AVX2, recommended)

@@ -52,6 +52,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install mingw-w64
+        timeout-minutes: 10
         run: sudo apt-get update -q && sudo apt-get install -y -q gcc-mingw-w64-x86-64
       - name: Build (portable AVX2, static)
         run: make portable OS=Windows_NT CC=x86_64-w64-mingw32-gcc
