@@ -2404,18 +2404,54 @@ static uint64_t repack_tensor(tensor_t *t) {
     return bytes;
 }
 
-// y = W·x for a repacked tensor (x already quantized to Q8_K in xk)
-static void matvec_q4Kx8(const tensor_t *t, const q8k_blk_t *xk, float *out) {
+// activation sums for the min term, in a buffer reused across calls (matvec runs on one thread)
+static const int32_t *q4kx8_bsums_buf(const q8k_blk_t *xk, int nb) {
     static int32_t *bsp;
     static int bsp_n;
-    int nb = (int)(t->ne[0] / 256);
     if (nb * 4 > bsp_n) { free(bsp); bsp = (int32_t *)malloc((size_t)nb * 4 * sizeof(int32_t)); bsp_n = nb * 4; }
     q4kx8_bsums(xk, nb, bsp);
+    return bsp;
+}
+
+// y = W·x for a repacked tensor (x already quantized to Q8_K in xk)
+static void matvec_q4Kx8(const tensor_t *t, const q8k_blk_t *xk, float *out) {
+    int nb = (int)(t->ne[0] / 256);
+    const int32_t *bsp = q4kx8_bsums_buf(xk, nb);
     int64_t ng = (int64_t)t->ne[1] / 8;
     const q4kx8_t *base = (const q4kx8_t *)t->rp;
     #pragma omp parallel for schedule(static)
     for (int64_t g = 0; g < ng; g++)
         dot_q4Kx8(base + (size_t)g * nb, xk, bsp, nb, out + 8 * g);
+}
+
+static int matvec(tensor_t *t, const float *x, float *out);
+
+// up to 4 matrices that read the same x (Q/K/V, FFN gate/up): the repacked ones run in one parallel
+// loop, so x is quantized once, there is one fork/join instead of several, and the small K/V
+// matrices share the threads with Q instead of running alone; the others go through matvec
+static int matvec_multi(int n, tensor_t *const *t, const float *x, float *const *out) {
+    tensor_t *f[4];
+    float *fo[4];
+    int nf = 0;
+    for (int i = 0; i < n; i++) {
+        if (!t[i]) continue;
+        if (n <= 4 && t[i]->rp && (nf == 0 || t[i]->ne[0] == f[0]->ne[0])) { f[nf] = t[i]; fo[nf++] = out[i]; }
+        else if (matvec(t[i], x, out[i]) != 0) return -1;
+    }
+    if (nf == 0) return 0;
+    int cols = (int)f[0]->ne[0], nb = cols / 256;
+    quantize_q8k(x, g_xq8k, cols);
+    const int32_t *bsp = q4kx8_bsums_buf(g_xq8k, nb);
+    int64_t first[5] = { 0 };
+    for (int i = 0; i < nf; i++) first[i + 1] = first[i] + (int64_t)f[i]->ne[1] / 8;
+    #pragma omp parallel for schedule(static)
+    for (int64_t gg = 0; gg < first[nf]; gg++) {
+        int i = 0;
+        while (gg >= first[i + 1]) i++;
+        int64_t g = gg - first[i];
+        dot_q4Kx8((const q4kx8_t *)f[i]->rp + (size_t)g * nb, g_xq8k, bsp, nb, fo[i] + 8 * g);
+    }
+    return 0;
 }
 
 static int matvec(tensor_t *t, const float *x, float *out) {
@@ -4530,8 +4566,15 @@ static float *forward(model_t *m, int token, int pos) {
         memcpy(m->cur, m->x, n_embd * sizeof(float));
         rmsnorm_w(m->cur, L->attn_norm, n_embd, m->norm_eps);
 
-        // Q → (bias) → per-head norm if present → RoPE
-        if (matvec(L->wq, m->cur, m->q) != 0) return NULL;
+        // Q → (bias) → per-head norm if present → RoPE (Q, K and V computed together when this layer
+        // owns its cache entries)
+        int own_kv = il < m->n_kv_from_start, kv_done = 0;
+        if (own_kv && L->wv) {
+            tensor_t *tq[3] = { L->wq, L->wk, L->wv };
+            float *oq[3] = { m->q, m->k, m->v };
+            if (matvec_multi(3, tq, m->cur, oq) != 0) return NULL;
+            kv_done = 1;
+        } else if (matvec(L->wq, m->cur, m->q) != 0) return NULL;
         if (L->bq) for (int i = 0; i < L->q_dim; i++) m->q[i] += L->bq[i];
         if (L->q_norm)
             for (int h = 0; h < L->n_head; h++)
@@ -4539,11 +4582,11 @@ static float *forward(model_t *m, int token, int pos) {
         apply_rope(m->q, L->q_dim, pos, hd, n_rot, base, fscale, ff, m->rope_neox);
 
         // K/V for owning layers
-        if (il < m->n_kv_from_start) {
-            if (matvec(L->wk, m->cur, m->k) != 0) return NULL;
+        if (own_kv) {
+            if (!kv_done && matvec(L->wk, m->cur, m->k) != 0) return NULL;
             if (L->bk) for (int i = 0; i < L->kv_dim; i++) m->k[i] += L->bk[i];
             if (L->wv) {
-                if (matvec(L->wv, m->cur, m->v) != 0) return NULL;
+                if (!kv_done && matvec(L->wv, m->cur, m->v) != 0) return NULL;
                 if (L->bv) for (int i = 0; i < L->kv_dim; i++) m->v[i] += L->bv[i];
             } else {
                 memcpy(m->v, m->k, L->kv_dim * sizeof(float)); // V = raw K projection
@@ -4704,8 +4747,9 @@ static float *forward(model_t *m, int token, int pos) {
         if (L->ffn_gate_inp) {
             if (moe_ffn(m, L, m->f, m->ffn_out) != 0) return NULL;
         } else {
-            if (matvec(L->ffn_gate, m->f, m->gate) != 0) return NULL;
-            if (matvec(L->ffn_up, m->f, m->up) != 0) return NULL;
+            tensor_t *tf[2] = { L->ffn_gate, L->ffn_up };
+            float *of[2] = { m->gate, m->up };
+            if (matvec_multi(2, tf, m->f, of) != 0) return NULL;
             if (m->act_gelu)
                 for (int i = 0; i < L->ff_dim; i++) m->gate[i] = gelu_f(m->gate[i]) * m->up[i];
             else
