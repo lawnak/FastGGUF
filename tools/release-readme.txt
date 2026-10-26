@@ -13,5 +13,6 @@ Commands:
   fastgguf gpu
   fastgguf selftest
 
-The "compat" build is for old CPUs without AVX2 (before 2013); it is much slower.
+Works on any 64-bit Intel / AMD CPU: the program picks the fastest kernels your CPU supports
+(AVX-512 VNNI, AVX-VNNI, AVX2, or plain x86-64 on CPUs from before 2013, which is much slower).
 Full documentation: https://github.com/REPO

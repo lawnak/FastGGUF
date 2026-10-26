@@ -10,10 +10,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build (portable AVX2)
+      - name: Build (portable: AVX-512 VNNI / AVX-VNNI / AVX2 / x86-64 in one binary)
         run: make portable
-      - name: Self-test
-        run: ./fastgguf selftest
+      - name: Self-test every build this CPU can run
+        run: |
+          for v in avx512 avxvnni avx2 sse2; do
+            FASTGGUF_CPU=$v ./fastgguf selftest > st.log 2>&1 || { cat st.log; exit 1; }
+            if grep -q "cannot run" st.log; then echo "$v: not supported by this runner"; else echo "$v: $(tail -1 st.log)"; fi
+          done
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -33,10 +37,12 @@ jobs:
           P=$(python3 -c "print('The quick brown fox jumps over the lazy dog. ' * 8)")
           for q in q8_0 q4_k_m q4_0; do
             python tools/synth_gguf.py tiny-test $q t.gguf
-            a=$(printf '%s\n' "$P" | ./fastgguf chat t.gguf 1024 --temp 0 --max-tokens 24 | grep -a '^llama>')
-            b=$(printf '%s\n' "$P" | FASTGGUF_BATCH=0 ./fastgguf chat t.gguf 1024 --temp 0 --max-tokens 24 | grep -a '^llama>')
-            echo "$q: $a"
-            [ -n "$a" ] && [ "$a" = "$b" ]
+            for cpu in auto avx2; do
+              a=$(printf '%s\n' "$P" | FASTGGUF_CPU=$cpu ./fastgguf chat t.gguf 1024 --temp 0 --max-tokens 24 2>/dev/null | grep -a '^llama>')
+              b=$(printf '%s\n' "$P" | FASTGGUF_CPU=$cpu FASTGGUF_BATCH=0 ./fastgguf chat t.gguf 1024 --temp 0 --max-tokens 24 2>/dev/null | grep -a '^llama>')
+              echo "$q ($cpu): $a"
+              [ -n "$a" ] && [ "$a" = "$b" ]
+            done
           done
       - uses: actions/upload-artifact@v4
         with:
@@ -59,7 +65,7 @@ jobs:
         with:
           msystem: UCRT64
           install: make mingw-w64-ucrt-x86_64-toolchain
-      - name: Build (portable AVX2)
+      - name: Build (portable: AVX-512 VNNI / AVX-VNNI / AVX2 / x86-64 in one .exe)
         run: make portable
       - name: No DLLs besides Windows' own
         run: |
@@ -67,8 +73,12 @@ jobs:
           for e in *.exe; do
             if ldd "$e" | grep -iE '/ucrt64/|/mingw64/|/usr/bin/'; then echo "$e needs MSYS2 DLLs"; exit 1; fi
           done
-      - name: Self-test
-        run: PATH=/c/Windows/System32:/c/Windows ./fastgguf.exe selftest
+      - name: Self-test every build this CPU can run (without MSYS2 on PATH)
+        run: |
+          for v in avx512 avxvnni avx2 sse2; do
+            PATH=/c/Windows/System32:/c/Windows FASTGGUF_CPU=$v ./fastgguf.exe selftest > st.log 2>&1 || { cat st.log; exit 1; }
+            if grep -q "cannot run" st.log; then echo "$v: not supported by this runner"; else echo "$v: $(tail -1 st.log)"; fi
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: fastgguf-windows-x86_64

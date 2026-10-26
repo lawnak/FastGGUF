@@ -1,7 +1,8 @@
 # fastgguf — build with GNU make (Linux, macOS, or Windows with MSYS2 / w64devkit)
 #
 #   make              optimized for THIS machine (-march=native)
-#   make portable     runs on any x86-64 CPU with AVX2 (Haswell / Zen 1 and newer)
+#   make portable     runs on any x86-64 CPU: carries AVX-512 VNNI, AVX-VNNI, AVX2 and plain
+#                     x86-64 builds of the engine and starts the fastest one the CPU supports
 #   make selftest     build and run the kernel self-test
 #   make clean
 
@@ -31,6 +32,12 @@ ifeq ($(OS),Windows_NT)
   else
     LDFLAGS = -static-libgcc
   endif
+  # MinGW gcc does not always keep the stack 32/64-byte aligned for AVX spills (gcc bug 54412);
+  # this assembler option turns the aligned vector moves into unaligned ones, which are just as fast
+  ifneq ($(shell echo "int x;" | $(CC) -Wa,-muse-unaligned-vector-move -x c -c -o /dev/null - 2>/dev/null && echo ok),)
+    CFLAGS += -Wa,-muse-unaligned-vector-move
+    PORT_WIN = -Wa,-muse-unaligned-vector-move
+  endif
 else
   EXE     =
   LDLIBS  = -lm -ldl
@@ -55,11 +62,28 @@ fastgguf-server$(EXE): $(SRC)
 fastgguf-console$(EXE): $(SRC)
 	$(CC) $(CFLAGS) -DFG_CONSOLE_MAIN -o $@ $< $(LDFLAGS) $(LDLIBS)
 
-portable:
-	$(MAKE) -B ARCH="-march=x86-64-v3"
+# portable: fastgguf.c compiled once per instruction set (FG_VARIANT), dispatch.c picks one at
+# start-up (FASTGGUF_CPU=avx512|avxvnni|avx2|sse2 forces one)
+PORT_FLAGS = -O3 $(OMP) -Wall -Wno-unused-function $(PORT_WIN)
+PORT_OBJS  = port-avx512.o port-avxvnni.o port-avx2.o port-sse2.o
+
+portable: $(PORT_OBJS)
+	$(CC) $(PORT_FLAGS) -o fastgguf$(EXE) dispatch.c $(PORT_OBJS) $(LDFLAGS) $(LDLIBS)
+	$(CC) $(PORT_FLAGS) -DFG_SERVER_MAIN -o fastgguf-server$(EXE) dispatch.c $(PORT_OBJS) $(LDFLAGS) $(LDLIBS)
+	$(CC) $(PORT_FLAGS) -DFG_CONSOLE_MAIN -o fastgguf-console$(EXE) dispatch.c $(PORT_OBJS) $(LDFLAGS) $(LDLIBS)
+	rm -f $(PORT_OBJS)
+
+port-avx512.o: $(SRC)
+	$(CC) $(PORT_FLAGS) -march=x86-64-v4 -mavx512vnni -DFG_VARIANT=avx512 -c -o $@ $<
+port-avxvnni.o: $(SRC)
+	$(CC) $(PORT_FLAGS) -march=x86-64-v3 -mavxvnni -DFG_VARIANT=avxvnni -c -o $@ $<
+port-avx2.o: $(SRC)
+	$(CC) $(PORT_FLAGS) -march=x86-64-v3 -DFG_VARIANT=avx2 -c -o $@ $<
+port-sse2.o: $(SRC)
+	$(CC) $(PORT_FLAGS) -march=x86-64 -DFG_VARIANT=sse2 -c -o $@ $<
 
 selftest: fastgguf$(EXE)
 	./fastgguf$(EXE) selftest
 
 clean:
-	rm -f $(BINS)
+	rm -f $(BINS) $(PORT_OBJS)

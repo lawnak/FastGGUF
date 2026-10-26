@@ -34,6 +34,42 @@ static int omp_get_max_threads(void) { return 1; }
 #include <immintrin.h>
 #endif
 
+// which instruction set this build's kernels use (shown at start-up)
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#define FG_CPU_BUILD "AVX-512 VNNI"
+#elif defined(__AVXVNNI__)
+#define FG_CPU_BUILD "AVX2 + AVX-VNNI"
+#elif defined(__AVX2__)
+#define FG_CPU_BUILD "AVX2"
+#else
+#define FG_CPU_BUILD "generic (no AVX2)"
+#endif
+
+// entry points: normally one main() chosen by FG_SERVER_MAIN / FG_CONSOLE_MAIN. The portable
+// build compiles this file once per instruction set with FG_VARIANT=<name>; then all three
+// entry points are built under names like fg_main_server_avx2, and dispatch.c picks one
+#if defined(FG_VARIANT)
+#define FG_CAT2(a, b) a##_##b
+#define FG_CAT(a, b) FG_CAT2(a, b)
+#define FG_MAIN_FULL    FG_CAT(fg_main_full, FG_VARIANT)
+#define FG_MAIN_SERVER  FG_CAT(fg_main_server, FG_VARIANT)
+#define FG_MAIN_CONSOLE FG_CAT(fg_main_console, FG_VARIANT)
+#define FG_BUILD_SERVER 1
+#define FG_BUILD_CONSOLE 1
+#define FG_BUILD_FULL 1
+#else
+#define FG_MAIN_FULL    main
+#define FG_MAIN_SERVER  main
+#define FG_MAIN_CONSOLE main
+#if defined(FG_SERVER_MAIN)
+#define FG_BUILD_SERVER 1
+#elif defined(FG_CONSOLE_MAIN)
+#define FG_BUILD_CONSOLE 1
+#else
+#define FG_BUILD_FULL 1
+#endif
+#endif
+
 #if defined(__GNUC__)
 #define MAYBE_UNUSED __attribute__((unused))
 #else
@@ -1834,7 +1870,7 @@ static int gpu_selfcheck(void) {
             w[i] = (uint8_t)(seed >> 33);
         }
         // random-byte fp16 scales may be inf/NaN — write small sane values
-        uint64_t be, bb;
+        uint64_t be = 32, bb = 0;
         block_size_of(type, &be, &bb);
         for (int r = 0; r < ROWS; r++) {
             uint8_t *rb = w + (size_t)r * stride;
@@ -4847,13 +4883,7 @@ static int cmd_chat(const char *path, int n_ctx, int max_tokens, sampler_t *smp)
     model_t *m = (model_t *)calloc(1, sizeof(model_t));
     if (model_load(m, &g, n_ctx) != 0) return 2;
 
-    printf("\n=== fastgguf-c | AVX2 %s | OpenMP %d threads ===\n",
-#if defined(__AVX2__)
-           "ON",
-#else
-           "OFF",
-#endif
-           omp_get_max_threads());
+    printf("\n=== fastgguf-c | CPU kernels: %s | OpenMP %d threads ===\n", FG_CPU_BUILD, omp_get_max_threads());
     // without --seed take a seed from the clock, and print it so the same reply can be reproduced with --seed
     if (smp->rng == 0) smp->rng = ((uint64_t)time(NULL) * 0x9E3779B97F4A7C15ULL) ^ (uint64_t)(now_sec() * 1e6);
     if (smp->rng == 0) smp->rng = 0x9E3779B97F4A7C15ULL;
@@ -5102,6 +5132,7 @@ static int test_sampler(void) {
 
 // Self-test: compare the AVX2 kernel against the scalar path and against dequantization
 static int cmd_selftest(void) {
+    printf("kernels: %s\n", FG_CPU_BUILD);
     srand(42);
     int n = 1024, nb = n / 32;
     int fails = 0;
@@ -6538,10 +6569,10 @@ static int parse_serve_args(char **argv, int from, int argc,
     return n_models;
 }
 
-#if defined(FG_SERVER_MAIN)
+#if defined(FG_BUILD_SERVER)
 
 // server-only build: fastgguf-server.exe <model.gguf> [model2.gguf ...] [port] [ctx]
-int main(int argc, char **argv) {
+int FG_MAIN_SERVER(int argc, char **argv) {
     common_init(&argc, &argv);
     char *paths[MAX_MODELS];
     int port = 8080, ctx = 4096;
@@ -6569,10 +6600,11 @@ int main(int argc, char **argv) {
     return cmd_serve_multi(paths, n_models, port, ctx);
 }
 
-#elif defined(FG_CONSOLE_MAIN)
+#endif
+#if defined(FG_BUILD_CONSOLE)
 
 // console build: fastgguf-console.exe <model.gguf> [ctx]  (or inspect/dump/selftest)
-int main(int argc, char **argv) {
+int FG_MAIN_CONSOLE(int argc, char **argv) {
     common_init(&argc, &argv);
     if (argc < 2) {
         printf("Usage: fastgguf-console <model.gguf> [ctx] [options]   terminal chat\n"
@@ -6600,9 +6632,10 @@ int main(int argc, char **argv) {
     return cmd_chat(argv[1], ctx, max_tokens, &smp);
 }
 
-#else
+#endif
+#if defined(FG_BUILD_FULL)
 
-int main(int argc, char **argv) {
+int FG_MAIN_FULL(int argc, char **argv) {
     common_init(&argc, &argv);
 
     if (argc < 2) {

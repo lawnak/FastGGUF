@@ -30,28 +30,26 @@ jobs:
         with:
           msystem: UCRT64
           install: make zip mingw-w64-ucrt-x86_64-toolchain
-      - name: Build (AVX2 + compat)
+      - name: Build (AVX-512 VNNI / AVX-VNNI / AVX2 / x86-64 in each .exe)
         run: |
           set -e
           make portable
           mkdir -p dist/win && mv *.exe dist/win/
-          make -B ARCH="-march=x86-64"
-          mkdir -p dist/win-compat && mv *.exe dist/win-compat/
       - name: No DLLs besides Windows' own, and self-test without MSYS2 on PATH
         run: |
           set -e
-          for d in win win-compat; do
-            for e in dist/$d/*.exe; do
-              if ldd "$e" | grep -iE '/ucrt64/|/mingw64/|/usr/bin/'; then echo "$e needs MSYS2 DLLs"; exit 1; fi
-            done
-            PATH=/c/Windows/System32:/c/Windows ./dist/$d/fastgguf.exe selftest
+          for e in dist/win/*.exe; do
+            if ldd "$e" | grep -iE '/ucrt64/|/mingw64/|/usr/bin/'; then echo "$e needs MSYS2 DLLs"; exit 1; fi
+          done
+          for v in avx512 avxvnni avx2 sse2; do
+            PATH=/c/Windows/System32:/c/Windows FASTGGUF_CPU=$v ./dist/win/fastgguf.exe selftest > st.log 2>&1 || { cat st.log; exit 1; }
+            if grep -q "cannot run" st.log; then echo "$v: not supported by this runner"; else echo "$v: $(tail -1 st.log)"; fi
           done
       - name: Package
         run: |
           sed "s#REPO#${{ github.repository }}#" tools/release-readme.txt > README.txt
-          for d in win win-compat; do cp chat.bat server.bat README.txt dist/$d/; done
+          cp chat.bat server.bat README.txt dist/win/
           (cd dist/win && zip -q -9 ../fastgguf-$TAG-windows-x64.zip *)
-          (cd dist/win-compat && zip -q -9 ../fastgguf-$TAG-windows-x64-compat.zip *)
           ls -la dist
       - uses: actions/upload-artifact@v4
         with:
@@ -62,10 +60,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build (AVX2) and self-test
+      - name: Build (AVX-512 VNNI / AVX-VNNI / AVX2 / x86-64 in each binary) and self-test
         run: |
+          set -e
           make portable
-          ./fastgguf selftest
+          for v in avx512 avxvnni avx2 sse2; do
+            FASTGGUF_CPU=$v ./fastgguf selftest > st.log 2>&1 || { cat st.log; exit 1; }
+            if grep -q "cannot run" st.log; then echo "$v: not supported by this runner"; else echo "$v: $(tail -1 st.log)"; fi
+          done
       - name: Package
         run: |
           mkdir -p dist/linux
@@ -96,15 +98,18 @@ jobs:
 
           | File | For |
           |---|---|
-          | \`fastgguf-$TAG-windows-x64.zip\` | **Windows 10/11, most PCs** (Intel 2013+ / AMD Ryzen, AVX2) |
-          | \`fastgguf-$TAG-windows-x64-compat.zip\` | Windows on old CPUs without AVX2 (slower) |
-          | \`fastgguf-$TAG-linux-x64.tar.gz\` | Linux x86-64 with AVX2 |
+          | \`fastgguf-$TAG-windows-x64.zip\` | **Windows 10/11**, any 64-bit Intel / AMD CPU |
+          | \`fastgguf-$TAG-linux-x64.tar.gz\` | Linux x86-64 |
+
+          Each program carries four builds of the engine (AVX-512 VNNI, AVX-VNNI, AVX2 and plain x86-64)
+          and starts the fastest one your CPU supports; the start-up line shows which.
 
           **Windows quick start:** unzip, then drag a \`.gguf\` model onto \`chat.bat\` (terminal chat)
           or \`server.bat\` (web chat at http://localhost:8080). No installation needed — static \`.exe\`,
           GPU (NVIDIA / AMD / Intel) used automatically through the graphics driver.
 
-          All binaries passed \`fastgguf selftest\` (Windows builds were built and tested on Windows).
+          All binaries passed \`fastgguf selftest\` for every build the CI machines can run (Windows builds
+          were built and tested on Windows).
           See the [README](https://github.com/${{ github.repository }}#readme) for supported models and settings.
           EOF
           if gh release view "$TAG" >/dev/null 2>&1; then
