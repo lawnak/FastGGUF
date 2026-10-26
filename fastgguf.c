@@ -2134,6 +2134,19 @@ static inline float dot_row(uint32_t type, int kind, const uint8_t *rb, const q8
     }
 }
 
+// software prefetch of the bytes PF_DIST ahead of a row that is about to be read. Each thread
+// walks its rows in order, but with compute between the loads the hardware prefetcher alone
+// leaves one core at ~5 GB/s; asking early more than doubles that (prefetches never fault, so
+// running past the end of the weights is harmless)
+#define PF_DIST 2048
+static inline void prefetch_ahead(const uint8_t *row, uint64_t n) {
+#if defined(__GNUC__)
+    for (uint64_t c = 0; c < n; c += 64) __builtin_prefetch(row + PF_DIST + c, 0, 3);
+#else
+    (void)row; (void)n;
+#endif
+}
+
 static int matvec(tensor_t *t, const float *x, float *out) {
     // weights uploaded to the GPU are multiplied there — any failure disables the GPU and continues on the CPU
     if (t->gpu && g_gpu.state == 1) {
@@ -2159,6 +2172,7 @@ static int matvec(tensor_t *t, const float *x, float *out) {
         #pragma omp parallel for schedule(static)
         for (int64_t pr = 0; pr < pairs; pr++) {
             int64_t r = pr * 2;
+            prefetch_ahead(raw + (uint64_t)r * stride, 2 * stride);
             dot_q4_0_q8_x2(raw + (uint64_t)r * stride, raw + (uint64_t)(r + 1) * stride,
                            g_xq8, nb32, &out[r], &out[r + 1]);
         }
@@ -2167,8 +2181,10 @@ static int matvec(tensor_t *t, const float *x, float *out) {
     }
 
     #pragma omp parallel for schedule(static)
-    for (int64_t r = 0; r < rows; r++)
+    for (int64_t r = 0; r < rows; r++) {
+        prefetch_ahead(raw + (uint64_t)r * stride, stride);
         out[r] = dot_row(t->type, use_q8, raw + (uint64_t)r * stride, g_xq8, g_xq8k, x, cols, &fail);
+    }
     if (fail) {
         fprintf(stderr, "matvec: unsupported type %s in %s\n", type_name(t->type), t->name);
         return -1;
@@ -2783,6 +2799,176 @@ static void softmax_inplace(float *s, int n) {
     if (sum > 0.0f) {
         float inv = 1.0f / sum;
         for (int i = 0; i < n; i++) s[i] *= inv;
+    }
+}
+
+// -------------------------------------------------------------------------
+// Attention for up to 4 query rows that share one KV head (the heads of a GQA group, and in a
+// prompt batch also neighbouring tokens). Row r attends to positions st[r]..en[r] of the ring
+// cache (slot = p % cap). Scores are computed 4 queries × 4 keys at a time and the value sum
+// 4 rows × 16-32 values at a time, so every loaded vector feeds several FMAs instead of one.
+// sb: scratch for 4 rows of scores, sld floats each (≥ max en − min st + 1).
+// -------------------------------------------------------------------------
+#if defined(__AVX2__) && defined(__FMA__)
+// e^x for x ≤ 0 (softmax after subtracting the max), Cephes polynomial, rel. error ~1e-7;
+// below -87 the result is exactly 0
+static inline __m256 exp_neg_ps(__m256 x) {
+    __m256 zero_mask = _mm256_cmp_ps(x, _mm256_set1_ps(-87.0f), _CMP_GT_OQ);
+    x = _mm256_max_ps(x, _mm256_set1_ps(-87.0f));
+    __m256 fx = _mm256_round_ps(_mm256_fmadd_ps(x, _mm256_set1_ps(1.44269504088896341f), _mm256_set1_ps(0.5f)),
+                                _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC);
+    x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(0.693359375f), x);
+    x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(-2.12194440e-4f), x);
+    __m256 y = _mm256_set1_ps(1.9875691500E-4f);
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(1.3981999507E-3f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(8.3334519073E-3f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(4.1665795894E-2f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(1.6666665459E-1f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(5.0000001201E-1f));
+    y = _mm256_fmadd_ps(y, _mm256_mul_ps(x, x), _mm256_add_ps(x, _mm256_set1_ps(1.0f)));
+    __m256i e = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvttps_epi32(fx), _mm256_set1_epi32(127)), 23);
+    return _mm256_and_ps(_mm256_mul_ps(y, _mm256_castsi256_ps(e)), zero_mask);
+}
+
+// [Σa, Σb, Σc, Σd]
+static inline __m128 hsum4_ps(__m256 a, __m256 b, __m256 c, __m256 d) {
+    __m256 t = _mm256_hadd_ps(_mm256_hadd_ps(a, b), _mm256_hadd_ps(c, d));
+    return _mm_add_ps(_mm256_castps256_ps128(t), _mm256_extractf128_ps(t, 1));
+}
+#endif
+
+// softmax of s[0..n) in place (vectorized exp)
+static void softmax_vec(float *s, int n) {
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 vm = _mm256_set1_ps(-INFINITY);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) vm = _mm256_max_ps(vm, _mm256_loadu_ps(s + i));
+    float mx = -INFINITY, tmp[8];
+    _mm256_storeu_ps(tmp, vm);
+    for (int j = 0; j < 8; j++) if (tmp[j] > mx) mx = tmp[j];
+    for (; i < n; i++) if (s[i] > mx) mx = s[i];
+    __m256 vmx = _mm256_set1_ps(mx), vs = _mm256_setzero_ps();
+    for (i = 0; i + 8 <= n; i += 8) {
+        __m256 e = exp_neg_ps(_mm256_sub_ps(_mm256_loadu_ps(s + i), vmx));
+        _mm256_storeu_ps(s + i, e);
+        vs = _mm256_add_ps(vs, e);
+    }
+    float sum = hsum_ps(vs);
+    for (; i < n; i++) { s[i] = expf(s[i] - mx); sum += s[i]; }
+    if (sum > 0.0f) {
+        __m256 vi = _mm256_set1_ps(1.0f / sum);
+        for (i = 0; i + 8 <= n; i += 8) _mm256_storeu_ps(s + i, _mm256_mul_ps(_mm256_loadu_ps(s + i), vi));
+        for (; i < n; i++) s[i] *= 1.0f / sum;
+    }
+#else
+    softmax_inplace(s, n);
+#endif
+}
+
+#if defined(__AVX2__) && defined(__FMA__)
+#if defined(__AVX512VL__)
+#define ATT_QK 4                      // queries per QK step (16 accumulators: needs 32 registers)
+#define ATT_VW 4                      // vectors of 8 values per row in the value sum
+#else
+#define ATT_QK 2
+#define ATT_VW 2
+#endif
+
+// NQ queries × 4 keys → s[r·sld + j] = scale · q_r·k_j
+static inline __attribute__((always_inline))
+void att_qk_kern(const int NQ, const float *const *q, const float *const *kp, int nk, int hd,
+                 float scale, float *s, int sld) {
+    __m256 a[4][4];
+    for (int r = 0; r < NQ; r++) for (int j = 0; j < 4; j++) a[r][j] = _mm256_setzero_ps();
+    for (int i = 0; i < hd; i += 8) {
+        __m256 k[4];
+        for (int j = 0; j < 4; j++) k[j] = _mm256_loadu_ps(kp[j] + i);
+        for (int r = 0; r < NQ; r++) {
+            __m256 qv = _mm256_loadu_ps(q[r] + i);
+            for (int j = 0; j < 4; j++) a[r][j] = _mm256_fmadd_ps(qv, k[j], a[r][j]);
+        }
+    }
+    for (int r = 0; r < NQ; r++) {
+        float o[4];
+        _mm_storeu_ps(o, _mm_mul_ps(hsum4_ps(a[r][0], a[r][1], a[r][2], a[r][3]), _mm_set1_ps(scale)));
+        for (int j = 0; j < nk; j++) s[r * sld + j] = o[j];
+    }
+}
+
+// rows o[r][c .. c + 8·ATT_VW) = Σ_p s[r][p] · V[p][c ..]
+static inline __attribute__((always_inline))
+void att_v_kern(const int NQ, float *const *o, int c, const float *s, int sld, int n,
+                const float *cv, int kv_dim, int kvo, int cap, int lo) {
+    __m256 a[4][ATT_VW];
+    for (int r = 0; r < NQ; r++) for (int v = 0; v < ATT_VW; v++) a[r][v] = _mm256_setzero_ps();
+    int slot = lo % cap;
+    for (int i = 0; i < n; i++) {
+        const float *pv = cv + (size_t)slot * kv_dim + kvo + c;
+        if (++slot == cap) slot = 0;
+        __m256 x[ATT_VW];
+        for (int v = 0; v < ATT_VW; v++) x[v] = _mm256_loadu_ps(pv + 8 * v);
+        for (int r = 0; r < NQ; r++) {
+            __m256 w = _mm256_broadcast_ss(s + r * sld + i);
+            for (int v = 0; v < ATT_VW; v++) a[r][v] = _mm256_fmadd_ps(w, x[v], a[r][v]);
+        }
+    }
+    for (int r = 0; r < NQ; r++)
+        for (int v = 0; v < ATT_VW; v++) _mm256_storeu_ps(o[r] + c + 8 * v, a[r][v]);
+}
+#endif
+
+static void attn_rows(int nr, const float *const *q, float *const *o, const int *st, const int *en,
+                      const float *ck, const float *cv, int kv_dim, int kvo, int cap, int hd,
+                      float scale, float *sb, int sld) {
+#if defined(__AVX2__) && defined(__FMA__)
+    if (hd % (8 * ATT_VW) == 0) {
+        int lo = st[0], hi = en[0];
+        for (int r = 1; r < nr; r++) { if (st[r] < lo) lo = st[r]; if (en[r] > hi) hi = en[r]; }
+        int n = hi - lo + 1;
+        // scores for the union range [lo, hi]; ATT_QK queries at a time (missing rows repeat row 0)
+        for (int r0 = 0; r0 < nr; r0 += ATT_QK) {
+            const float *qq[4];
+            for (int r = 0; r < ATT_QK; r++) qq[r] = q[r0 + r < nr ? r0 + r : r0];
+            for (int p = lo; p <= hi; p += 4) {
+                int nk = hi - p + 1 < 4 ? hi - p + 1 : 4;
+                const float *kp[4];
+                for (int j = 0; j < 4; j++) kp[j] = ck + (size_t)((p + (j < nk ? j : 0)) % cap) * kv_dim + kvo;
+                float *s = sb + (size_t)r0 * sld + (p - lo);
+                // padded rows land in the unused rows of sb (it always has 4)
+                if (nr - r0 == 1) att_qk_kern(1, qq, kp, nk, hd, scale, s, sld);
+                else              att_qk_kern(ATT_QK, qq, kp, nk, hd, scale, s, sld);
+            }
+        }
+        // softmax on each row's own range, zero outside it
+        for (int r = 0; r < nr; r++) {
+            float *s = sb + (size_t)r * sld;
+            for (int i = 0; i < st[r] - lo; i++) s[i] = 0.0f;
+            softmax_vec(s + (st[r] - lo), en[r] - st[r] + 1);
+            for (int i = en[r] - lo + 1; i < n; i++) s[i] = 0.0f;
+        }
+        for (int c = 0; c < hd; c += 8 * ATT_VW) {
+            switch (nr) {
+            case 4:  att_v_kern(4, o, c, sb, sld, n, cv, kv_dim, kvo, cap, lo); break;
+            case 3:  att_v_kern(3, o, c, sb, sld, n, cv, kv_dim, kvo, cap, lo); break;
+            case 2:  att_v_kern(2, o, c, sb, sld, n, cv, kv_dim, kvo, cap, lo); break;
+            default: att_v_kern(1, o, c, sb, sld, n, cv, kv_dim, kvo, cap, lo); break;
+            }
+        }
+        return;
+    }
+#endif
+    for (int r = 0; r < nr; r++) {
+        float *s = sb + (size_t)r * sld;
+        int m = en[r] - st[r] + 1;
+        for (int p = st[r]; p <= en[r]; p++)
+            s[p - st[r]] = dot_f32v(q[r], ck + (size_t)(p % cap) * kv_dim + kvo, hd) * scale;
+        softmax_vec(s, m);
+        memset(o[r], 0, hd * sizeof(float));
+        for (int p = st[r]; p <= en[r]; p++) {
+            const float *pv = cv + (size_t)(p % cap) * kv_dim + kvo;
+            float w = s[p - st[r]];
+            for (int i = 0; i < hd; i++) o[r][i] += w * pv[i];
+        }
     }
 }
 
@@ -3596,6 +3782,7 @@ typedef struct {
     cand_t *cand;   // sampling workspace (n_vocab)
     // prompt batches (allocated on first use): FG_BATCH rows each; ld_* = row length
     float *bx, *bcur, *bq, *bk, *bv, *batt, *bao, *bf, *bgate, *bup, *bffn, *bscores;
+    float *ascores; int ald;     // attn_rows scratch: 4 rows of ald floats per thread
     int ld_q, ld_kv, ld_ff;
 } model_t;
 
@@ -3929,6 +4116,8 @@ static int model_load(model_t *m, gguf_t *g, int n_ctx) {
     m->ffn_out  = (float *)malloc(m->n_embd * sizeof(float));
     m->scores   = (float *)malloc(n_ctx * sizeof(float));
     m->bscores  = (float *)malloc((size_t)omp_get_max_threads() * n_ctx * sizeof(float)); // per thread
+    m->ald = n_ctx + 8;
+    m->ascores = (float *)malloc((size_t)omp_get_max_threads() * 4 * m->ald * sizeof(float));
     if (m->kvq == 2) { // debug mode: unrotated copy of q + reference output + reference scores
         m->dbg_q      = (float *)malloc(max_q * sizeof(float));
         m->dbg_o      = (float *)malloc(max_q * sizeof(float));
@@ -4198,57 +4387,77 @@ static float *forward(model_t *m, int token, int pos) {
         if (m->kvq == 2) memset(m->dbg_o, 0, (size_t)L->q_dim * sizeof(float));
 
         memset(m->attn_out, 0, (size_t)L->q_dim * sizeof(float));
-        // heads are independent: split them over the threads (each has its own scores buffer);
-        // the KV debug mode (kvq == 2) shares buffers and stays on one thread
-        int par = m->kvq != 2 && (long)np * L->n_head >= 2048;
-        #pragma omp parallel for schedule(static) if(par)
-        for (int h = 0; h < L->n_head; h++) {
-            float *scores = par ? m->bscores + (size_t)omp_get_thread_num() * m->n_ctx : m->scores;
-            int kvh = h * n_head_kv / L->n_head;
-            const float *qh = m->q + h * hd;
-            int kvo = kvh * hd;
-            if (m->kvq) {
-                for (int p = start; p <= pos; p++) {
-                    const uint8_t *rk = ckq + (size_t)(p % cache_cap) * kqs
-                                      + kvh * KVQ_REC(hd, m->kvq_kbits);
-                    scores[p - start] = kvq_dot_k(qh, rk, hd, m->kvq_kbits) * qk_scale;
+        int G = L->n_head / n_head_kv;
+        if (!m->kvq && G * n_head_kv == L->n_head) {
+            // the heads of each GQA group together (they read the same keys and values); groups of
+            // up to 4, smaller when there would be fewer groups than threads
+            int R = 4, nt = omp_get_max_threads();
+            while (R > 1 && n_head_kv * ((G + R - 1) / R) < nt) R /= 2;
+            int ng = (G + R - 1) / R, par = (long)np * L->n_head >= 2048;
+            #pragma omp parallel for schedule(static) if(par)
+            for (int it = 0; it < n_head_kv * ng; it++) {
+                int kvh = it / ng, g0 = (it % ng) * R, nr = G - g0 < R ? G - g0 : R;
+                const float *qr[4]; float *orow[4]; int st[4], en[4];
+                for (int r = 0; r < nr; r++) {
+                    int h = kvh * G + g0 + r;
+                    qr[r] = m->q + h * hd; orow[r] = m->attn_out + h * hd; st[r] = start; en[r] = pos;
                 }
-            } else {
-                for (int p = start; p <= pos; p++) {
-                    const float *pk = ck + (size_t)(p % cache_cap) * kv_dim + kvo;
-                    scores[p - start] = dot_f32v(qh, pk, hd) * qk_scale;
-                }
+                attn_rows(nr, qr, orow, st, en, ck, cv, kv_dim, kvh * hd, cache_cap, hd, qk_scale,
+                          m->ascores + (size_t)(par ? omp_get_thread_num() : 0) * 4 * m->ald, m->ald);
             }
-            if (m->kvq == 2) { // reference: the same computation with unrotated q and the f32 cache
-                const float *qf = m->dbg_q + h * hd;
-                for (int p = start; p <= pos; p++) {
-                    const float *pk = ck + (size_t)(p % cache_cap) * kv_dim + kvo;
-                    float sf = dot_f32v(qf, pk, hd) * qk_scale;
-                    m->dbg_scores[p - start] = sf;
-                    float d = fabsf(scores[p - start] - sf);
-                    if (d > dbg_serr) dbg_serr = d;
-                    if (fabsf(sf) > dbg_smax) dbg_smax = fabsf(sf);
-                }
-                softmax_inplace(m->dbg_scores, np);
-                float *od = m->dbg_o + h * hd;
-                for (int p = start; p <= pos; p++) {
-                    float w = m->dbg_scores[p - start];
-                    if (w == 0.0f) continue;
-                    const float *pv = cv + (size_t)(p % cache_cap) * kv_dim + kvo;
-                    for (int i = 0; i < hd; i++) od[i] += w * pv[i];
-                }
-            }
-            softmax_inplace(scores, np);
-            float *oh = m->attn_out + h * hd;
-            for (int p = start; p <= pos; p++) {
-                float w = scores[p - start];
-                if (w == 0.0f) continue;
+        } else {
+            // TurboQuant cache: heads one by one, split over the threads (each has its own scores
+            // buffer); the KV debug mode (kvq == 2) shares buffers and stays on one thread
+            int par = m->kvq != 2 && (long)np * L->n_head >= 2048;
+            #pragma omp parallel for schedule(static) if(par)
+            for (int h = 0; h < L->n_head; h++) {
+                float *scores = par ? m->bscores + (size_t)omp_get_thread_num() * m->n_ctx : m->scores;
+                int kvh = h * n_head_kv / L->n_head;
+                const float *qh = m->q + h * hd;
+                int kvo = kvh * hd;
                 if (m->kvq) {
-                    kvq_axpy_v(oh, w, cvq + (size_t)(p % cache_cap) * vqs
-                                    + kvh * KVQ_REC(hd, m->kvq_vbits), hd, m->kvq_vbits);
+                    for (int p = start; p <= pos; p++) {
+                        const uint8_t *rk = ckq + (size_t)(p % cache_cap) * kqs
+                                          + kvh * KVQ_REC(hd, m->kvq_kbits);
+                        scores[p - start] = kvq_dot_k(qh, rk, hd, m->kvq_kbits) * qk_scale;
+                    }
                 } else {
-                    const float *pv = cv + (size_t)(p % cache_cap) * kv_dim + kvo;
-                    for (int i = 0; i < hd; i++) oh[i] += w * pv[i];
+                    for (int p = start; p <= pos; p++) {
+                        const float *pk = ck + (size_t)(p % cache_cap) * kv_dim + kvo;
+                        scores[p - start] = dot_f32v(qh, pk, hd) * qk_scale;
+                    }
+                }
+                if (m->kvq == 2) { // reference: the same computation with unrotated q and the f32 cache
+                    const float *qf = m->dbg_q + h * hd;
+                    for (int p = start; p <= pos; p++) {
+                        const float *pk = ck + (size_t)(p % cache_cap) * kv_dim + kvo;
+                        float sf = dot_f32v(qf, pk, hd) * qk_scale;
+                        m->dbg_scores[p - start] = sf;
+                        float d = fabsf(scores[p - start] - sf);
+                        if (d > dbg_serr) dbg_serr = d;
+                        if (fabsf(sf) > dbg_smax) dbg_smax = fabsf(sf);
+                    }
+                    softmax_inplace(m->dbg_scores, np);
+                    float *od = m->dbg_o + h * hd;
+                    for (int p = start; p <= pos; p++) {
+                        float w = m->dbg_scores[p - start];
+                        if (w == 0.0f) continue;
+                        const float *pv = cv + (size_t)(p % cache_cap) * kv_dim + kvo;
+                        for (int i = 0; i < hd; i++) od[i] += w * pv[i];
+                    }
+                }
+                softmax_inplace(scores, np);
+                float *oh = m->attn_out + h * hd;
+                for (int p = start; p <= pos; p++) {
+                    float w = scores[p - start];
+                    if (w == 0.0f) continue;
+                    if (m->kvq) {
+                        kvq_axpy_v(oh, w, cvq + (size_t)(p % cache_cap) * vqs
+                                        + kvh * KVQ_REC(hd, m->kvq_vbits), hd, m->kvq_vbits);
+                    } else {
+                        const float *pv = cv + (size_t)(p % cache_cap) * kv_dim + kvo;
+                        for (int i = 0; i < hd; i++) oh[i] += w * pv[i];
+                    }
                 }
             }
         }
@@ -4346,7 +4555,7 @@ static int batch_alloc(model_t *m) {
     m->bgate = (float *)malloc(B * max_ff * sizeof(float));
     m->bup   = (float *)malloc(B * max_ff * sizeof(float));
     if (!m->bx || !m->bcur || !m->bao || !m->bf || !m->bffn || !m->bq || !m->batt || !m->bk ||
-        !m->bv || !m->bgate || !m->bup || !m->bscores) return -1;
+        !m->bv || !m->bgate || !m->bup || !m->bscores || !m->ascores) return -1;
     return 0;
 }
 
@@ -4429,41 +4638,61 @@ static int forward_chunk(model_t *m, const int *toks, int nb, int pos0, int want
         const float *ck = m->cache_k[dl], *cv = m->cache_v[dl];
         const uint8_t *ckq = m->cache_kq[dl], *cvq = m->cache_vq[dl];
         int kqs = m->kq_stride[dl], vqs = m->vq_stride[dl];
-        int n_head = L->n_head;
-        #pragma omp parallel for schedule(dynamic, 1)
-        for (int bh = 0; bh < nb * n_head; bh++) {
-            int b = bh / n_head, h = bh % n_head, pos = pos0 + b;
-            float *scores = m->bscores + (size_t)omp_get_thread_num() * m->n_ctx;
-            int start = 0;
-            if (swa && m->n_swa > 0 && pos + 1 > m->n_swa) start = pos + 1 - m->n_swa;
-            if (pos + 1 - start > cache_cap) start = pos + 1 - cache_cap;
-            int np = pos + 1 - start;
-            int kvh = h * n_head_kv / n_head, kvo = kvh * hd;
-            float *qh = m->bq + (size_t)b * LQ + h * hd;
-            float *oh = m->batt + (size_t)b * LQ + h * hd;
-            if (m->kvq) {
-                kvq_rotate(qh, hd);
-                for (int p = start; p <= pos; p++)
-                    scores[p - start] = kvq_dot_k(qh, ckq + (size_t)(p % cache_cap) * kqs
-                                                  + kvh * KVQ_REC(hd, m->kvq_kbits), hd, m->kvq_kbits) * qk_scale;
-            } else {
-                for (int p = start; p <= pos; p++)
-                    scores[p - start] = dot_f32v(qh, ck + (size_t)(p % cache_cap) * kv_dim + kvo, hd) * qk_scale;
-            }
-            softmax_inplace(scores, np);
-            memset(oh, 0, hd * sizeof(float));
-            for (int p = start; p <= pos; p++) {
-                float w = scores[p - start];
-                if (w == 0.0f) continue;
-                if (m->kvq) {
-                    kvq_axpy_v(oh, w, cvq + (size_t)(p % cache_cap) * vqs
-                                    + kvh * KVQ_REC(hd, m->kvq_vbits), hd, m->kvq_vbits);
-                } else {
-                    const float *pv = cv + (size_t)(p % cache_cap) * kv_dim + kvo;
-                    for (int i = 0; i < hd; i++) oh[i] += w * pv[i];
+        int n_head = L->n_head, G = n_head / n_head_kv;
+        if (!m->kvq && G * n_head_kv == n_head) {
+            // rows (token b, head g of the group) of one KV head, 4 at a time
+            int nrows = nb * G, ntile = (nrows + 3) / 4;
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int it = 0; it < n_head_kv * ntile; it++) {
+                int kvh = it / ntile, r0 = (it % ntile) * 4, nr = nrows - r0 < 4 ? nrows - r0 : 4;
+                const float *qr[4]; float *orow[4]; int st[4], en[4];
+                for (int r = 0; r < nr; r++) {
+                    int b = (r0 + r) / G, h = kvh * G + (r0 + r) % G, pos = pos0 + b, start = 0;
+                    if (swa && m->n_swa > 0 && pos + 1 > m->n_swa) start = pos + 1 - m->n_swa;
+                    if (pos + 1 - start > cache_cap) start = pos + 1 - cache_cap;
+                    qr[r] = m->bq + (size_t)b * LQ + h * hd;
+                    orow[r] = m->batt + (size_t)b * LQ + h * hd;
+                    st[r] = start; en[r] = pos;
                 }
+                attn_rows(nr, qr, orow, st, en, ck, cv, kv_dim, kvh * hd, cache_cap, hd, qk_scale,
+                          m->ascores + (size_t)omp_get_thread_num() * 4 * m->ald, m->ald);
             }
-            if (m->kvq) kvq_unrotate(oh, hd);
+        } else {
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int bh = 0; bh < nb * n_head; bh++) {
+                int b = bh / n_head, h = bh % n_head, pos = pos0 + b;
+                float *scores = m->bscores + (size_t)omp_get_thread_num() * m->n_ctx;
+                int start = 0;
+                if (swa && m->n_swa > 0 && pos + 1 > m->n_swa) start = pos + 1 - m->n_swa;
+                if (pos + 1 - start > cache_cap) start = pos + 1 - cache_cap;
+                int np = pos + 1 - start;
+                int kvh = h * n_head_kv / n_head, kvo = kvh * hd;
+                float *qh = m->bq + (size_t)b * LQ + h * hd;
+                float *oh = m->batt + (size_t)b * LQ + h * hd;
+                if (m->kvq) {
+                    kvq_rotate(qh, hd);
+                    for (int p = start; p <= pos; p++)
+                        scores[p - start] = kvq_dot_k(qh, ckq + (size_t)(p % cache_cap) * kqs
+                                                      + kvh * KVQ_REC(hd, m->kvq_kbits), hd, m->kvq_kbits) * qk_scale;
+                } else {
+                    for (int p = start; p <= pos; p++)
+                        scores[p - start] = dot_f32v(qh, ck + (size_t)(p % cache_cap) * kv_dim + kvo, hd) * qk_scale;
+                }
+                softmax_inplace(scores, np);
+                memset(oh, 0, hd * sizeof(float));
+                for (int p = start; p <= pos; p++) {
+                    float w = scores[p - start];
+                    if (w == 0.0f) continue;
+                    if (m->kvq) {
+                        kvq_axpy_v(oh, w, cvq + (size_t)(p % cache_cap) * vqs
+                                        + kvh * KVQ_REC(hd, m->kvq_vbits), hd, m->kvq_vbits);
+                    } else {
+                        const float *pv = cv + (size_t)(p % cache_cap) * kv_dim + kvo;
+                        for (int i = 0; i < hd; i++) oh[i] += w * pv[i];
+                    }
+                }
+                if (m->kvq) kvq_unrotate(oh, hd);
+            }
         }
 
         // output projection + post_attention_norm + residual
@@ -5132,6 +5361,51 @@ static int cmd_selftest(void) {
             free(w);
         }
         free(X); free(Y);
+    }
+
+    // --- attention rows (QK tiles, softmax, value sum) against a plain double computation; ring
+    //     cache that wraps, rows with different ranges, every row count, and a head size that
+    //     takes the scalar path ---
+    {
+        static const int hds[4] = { 64, 128, 256, 40 };
+        int cap = 37, kvd = 2 * 256, ok_all = 1;
+        double worst = 0;
+        float *ck = (float *)malloc((size_t)cap * kvd * sizeof(float));
+        float *cv = (float *)malloc((size_t)cap * kvd * sizeof(float));
+        float *qb = (float *)malloc(4 * 256 * sizeof(float)), *ob = (float *)malloc(4 * 256 * sizeof(float));
+        float *sb = (float *)malloc(4 * 64 * sizeof(float));
+        for (int i = 0; i < cap * kvd; i++) { ck[i] = (float)(rand() % 2001 - 1000) / 1000.0f; cv[i] = (float)(rand() % 2001 - 1000) / 1000.0f; }
+        for (int hi = 0; hi < 4; hi++)
+            for (int nr = 1; nr <= 4; nr++) {
+                int hd = hds[hi], kvo = hd;   // second KV head
+                const float *qr[4]; float *orow[4]; int st[4], en[4];
+                for (int r = 0; r < nr; r++) {
+                    qr[r] = qb + r * 256; orow[r] = ob + r * 256;
+                    for (int i = 0; i < hd; i++) qb[r * 256 + i] = (float)(rand() % 2001 - 1000) / 250.0f;
+                    en[r] = 50 + r * 3 + (rand() % 3); st[r] = en[r] - 20 - (rand() % 13);   // up to 33 < cap
+                }
+                attn_rows(nr, qr, orow, st, en, ck, cv, kvd, kvo, cap, hd, 0.125f, sb, 64);
+                for (int r = 0; r < nr; r++) {
+                    double sc[64], mx = -1e300, sum = 0;
+                    for (int p = st[r]; p <= en[r]; p++) {
+                        double d = 0;
+                        for (int i = 0; i < hd; i++) d += (double)qr[r][i] * ck[(size_t)(p % cap) * kvd + kvo + i];
+                        sc[p - st[r]] = d * 0.125;
+                        if (sc[p - st[r]] > mx) mx = sc[p - st[r]];
+                    }
+                    for (int p = st[r]; p <= en[r]; p++) { sc[p - st[r]] = exp(sc[p - st[r]] - mx); sum += sc[p - st[r]]; }
+                    for (int i = 0; i < hd; i++) {
+                        double o = 0;
+                        for (int p = st[r]; p <= en[r]; p++) o += sc[p - st[r]] / sum * cv[(size_t)(p % cap) * kvd + kvo + i];
+                        double e = fabs(o - orow[r][i]);
+                        if (e > worst) worst = e;
+                    }
+                }
+            }
+        if (worst > 1e-4) ok_all = 0;
+        printf("attention rows vs double reference: max_err=%.2e %s\n", worst, ok_all ? "OK" : "FAIL");
+        if (!ok_all) fails++;
+        free(ck); free(cv); free(qb); free(ob); free(sb);
     }
 
     // --- 4-input kernels (prompt batches) must equal 4 single-input calls ---
