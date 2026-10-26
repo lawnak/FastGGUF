@@ -399,6 +399,8 @@ system message and the latest message are always kept).
 | `FASTGGUF_API_KEY` | any text | server requires `Authorization: Bearer <key>` |
 | `OMP_NUM_THREADS` | number | CPU threads (default: all) |
 | `FASTGGUF_BATCH` | `0` | read prompts token by token instead of in batches (same results up to float rounding, much slower; for troubleshooting) |
+| `FASTGGUF_CPU` | `avx512`, `avxvnni`, `avx2`, `sse2` | release downloads only: force one of the built-in kernel sets (default: the fastest your CPU supports) |
+| `FASTGGUF_THP` | `0` | Linux: do not ask for 2 MB pages when mapping the model file (on by default; ~5 % faster generation on recent kernels) |
 
 Windows example: `set FASTGGUF_KV=turbo` then `fastgguf.exe chat model.gguf 16384`.
 
