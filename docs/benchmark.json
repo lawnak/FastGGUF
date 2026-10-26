@@ -11,12 +11,13 @@
     {
       "model": "qwen2.5-0.5b-q4_0",
       "gb": 0.281,
-      "fastgguf": 103.89,
-      "llamacpp": 79.0,
-      "prompt_fastgguf": 722.5,
-      "prompt_llamacpp": 585.9,
-      "long_fastgguf": 90.5,
-      "long_llamacpp": 63.2
+      "fastgguf": 186.94,
+      "llamacpp": 87.5,
+      "prompt_fastgguf": 747.5,
+      "prompt_llamacpp": 584.7,
+      "long_fastgguf": 132.27,
+      "long_llamacpp": 72.0,
+      "note": "re-measured for v0.10.0 (Q4_0 repacking)"
     },
     {
       "model": "qwen2.5-0.5b-q8_0",
@@ -41,12 +42,13 @@
     {
       "model": "llama-3.2-1b-q4_0",
       "gb": 0.698,
-      "fastgguf": 40.69,
-      "llamacpp": 32.2,
-      "prompt_fastgguf": 344.4,
-      "prompt_llamacpp": 248.9,
-      "long_fastgguf": 33.48,
-      "long_llamacpp": 24.3
+      "fastgguf": 60.28,
+      "llamacpp": 29.2,
+      "prompt_fastgguf": 347.4,
+      "prompt_llamacpp": 236.8,
+      "long_fastgguf": 47.03,
+      "long_llamacpp": 23.7,
+      "note": "re-measured for v0.10.0 (Q4_0 repacking)"
     },
     {
       "model": "llama-3.2-1b-q8_0",

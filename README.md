@@ -233,10 +233,10 @@ random values, so anyone can reproduce the numbers without downloading anything.
 
 | Model | Weights | File | Prompt (512 tokens) fastgguf / llama.cpp | Generation fastgguf / llama.cpp | Generation at 1,500 context |
 |---|---|---|---|---|---|
-| Qwen2.5 0.5B | Q4_0 | 0.28 GB | **722** / 586 | **103.9** / 79.0 | **90.5** / 63.2 |
+| Qwen2.5 0.5B | Q4_0 | 0.28 GB | **748** / 585 | **186.9** / 87.5¹ | **132.3** / 72.0¹ |
 | Qwen2.5 0.5B | Q8_0 | 0.53 GB | **717** / 413 | **67.7** / 37.9 | **72.2** / 39.2 |
 | Qwen2.5 0.5B | Q4_K_M | 0.40 GB | **718** / 454 | **83.8** / 42.0 | **68.6** / 38.7 |
-| Llama 3.2 1B | Q4_0 | 0.70 GB | **344** / 249 | **40.7** / 32.2 | **33.5** / 24.3 |
+| Llama 3.2 1B | Q4_0 | 0.70 GB | **347** / 237 | **60.3** / 29.2¹ | **47.0** / 23.7¹ |
 | Llama 3.2 1B | Q8_0 | 1.32 GB | **323** / 176 | **29.2** / 20.8 | **24.5** / 18.4 |
 | Llama 3.2 1B | Q4_K_M | 0.80 GB | **309** / 278 | **41.9** / 32.6 | **37.5** / 28.4 |
 | Gemma 3 1B | Q4_K_M | 0.81 GB | **311** / 230 | **36.6** / 23.5 | **37.2** / 22.9 |
@@ -245,7 +245,8 @@ random values, so anyone can reproduce the numbers without downloading anything.
 | Qwen3 4B | Q4_K_M | 2.50 GB | **83** / 74 | **11.8** / 10.7 | **9.5** / 7.4 |
 | Llama 3.1 8B | Q4_K_M | 4.92 GB | **48** / 41 | **7.2** / 6.4 | **6.1** / 5.4 |
 
-All numbers are tokens per second; the faster engine is in bold. The VM's speed drifts over the day
+All numbers are tokens per second; the faster engine is in bold. ¹ Q4_0 rows re-measured for v0.10.0
+(Q4_0 repacking), both engines back to back. The VM's speed drifts over the day
 (the same binary can measure 30 % faster an hour later), so each model was measured with both engines
 back to back, in one run. llama.cpp's results for the smallest models varied most between sessions
 (Qwen2.5 0.5B Q4_0 generation: 71–118 tok/s in different sessions), so treat their ratios with care.
@@ -253,7 +254,7 @@ back to back, in one run. llama.cpp's results for the smallest models varied mos
 **What the numbers say**
 
 - **fastgguf is faster than llama.cpp for every model and weight type measured here:** reading the prompt
-  1.1–1.8×, generating with a short context 1.1–2.0×, generating with 1,500 tokens of context 1.1–1.8×.
+  1.1–1.8×, generating with a short context 1.1–2.1×, generating with 1,500 tokens of context 1.1–2.0×.
 - The gap is smallest for the larger Q4_K_M files (3B–8B: about 1.1×), where both engines are close to
   what the memory can deliver, and largest for small models and Q8_0 / Q4_K_M files of 0.5B–1B.
 - Threads (Llama 3.2 1B Q4_K_M, generation, measured separately): fastgguf 13.7 / 24.1 / 48.9 tok/s with 1 / 2 / 4
@@ -265,6 +266,9 @@ back to back, in one run. llama.cpp's results for the smallest models varied mos
 **What changed recently** (each change measured against the version before it on the same VM, at the
 same time)
 
+- **v0.10.0 — Q4_0 weights re-arranged at load time** like Q4_K (8 rows side by side, same size as the
+  file): generation +42–50 % for Q4_0 files (Llama 3.2 1B 40.9 → 58.2 tok/s, Qwen2.5 0.5B 108 → 163).
+  The prompt GEMM rebuilds rows from the new layout with one vector load, so prompt speed is unchanged.
 - **v0.9.0 — Q4_K weights re-arranged at load time:** 8 rows are stored side by side, so one 32-byte load
   feeds 8 rows and every vector lane stays one row (no horizontal sums, scales applied to 8 rows at once).
   +4–14 % generation for Q4_K_M files. Costs extra RAM about the size of the Q4_K weights and a few

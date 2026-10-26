@@ -41,10 +41,10 @@
   <text class="tick" x="930.0" y="620" text-anchor="middle">800</text>
   <text class="lab" x="236" y="114.0" text-anchor="end">Qwen2.5 0.5B</text>
   <text class="lab2" x="236" y="130.0" text-anchor="end">Q4_0 · 0.28 GB</text>
-  <path class="s1" d="M250.0,102.0 H860.1 Q864.1,102.0 864.1,106.0 V112.0 Q864.1,116.0 860.1,116.0 H250.0 Z"/>
-  <text class="val" x="870.1" y="113.0">722.5</text>
-  <path class="s2" d="M250.0,118.0 H744.0 Q748.0,118.0 748.0,122.0 V128.0 Q748.0,132.0 744.0,132.0 H250.0 Z"/>
-  <text class="val" x="754.0" y="129.0">585.9</text>
+  <path class="s1" d="M250.0,102.0 H881.4 Q885.4,102.0 885.4,106.0 V112.0 Q885.4,116.0 881.4,116.0 H250.0 Z"/>
+  <text class="val" x="891.4" y="113.0">747.5</text>
+  <path class="s2" d="M250.0,118.0 H743.0 Q747.0,118.0 747.0,122.0 V128.0 Q747.0,132.0 743.0,132.0 H250.0 Z"/>
+  <text class="val" x="753.0" y="129.0">584.7</text>
   <text class="lab" x="236" y="160.0" text-anchor="end">Qwen2.5 0.5B</text>
   <text class="lab2" x="236" y="176.0" text-anchor="end">Q8_0 · 0.53 GB</text>
   <path class="s1" d="M250.0,148.0 H855.5 Q859.5,148.0 859.5,152.0 V158.0 Q859.5,162.0 855.5,162.0 H250.0 Z"/>
@@ -59,10 +59,10 @@
   <text class="val" x="641.6" y="221.0">453.7</text>
   <text class="lab" x="236" y="252.0" text-anchor="end">Llama 3.2 1B</text>
   <text class="lab2" x="236" y="268.0" text-anchor="end">Q4_0 · 0.70 GB</text>
-  <path class="s1" d="M250.0,240.0 H538.7 Q542.7,240.0 542.7,244.0 V250.0 Q542.7,254.0 538.7,254.0 H250.0 Z"/>
-  <text class="val" x="548.7" y="251.0">344.4</text>
-  <path class="s2" d="M250.0,256.0 H457.6 Q461.6,256.0 461.6,260.0 V266.0 Q461.6,270.0 457.6,270.0 H250.0 Z"/>
-  <text class="val" x="467.6" y="267.0">248.9</text>
+  <path class="s1" d="M250.0,240.0 H541.3 Q545.3,240.0 545.3,244.0 V250.0 Q545.3,254.0 541.3,254.0 H250.0 Z"/>
+  <text class="val" x="551.3" y="251.0">347.4</text>
+  <path class="s2" d="M250.0,256.0 H447.3 Q451.3,256.0 451.3,260.0 V266.0 Q451.3,270.0 447.3,270.0 H250.0 Z"/>
+  <text class="val" x="457.3" y="267.0">236.8</text>
   <text class="lab" x="236" y="298.0" text-anchor="end">Llama 3.2 1B</text>
   <text class="lab2" x="236" y="314.0" text-anchor="end">Q8_0 · 1.32 GB</text>
   <path class="s1" d="M250.0,286.0 H520.7 Q524.7,286.0 524.7,290.0 V296.0 Q524.7,300.0 520.7,300.0 H250.0 Z"/>
