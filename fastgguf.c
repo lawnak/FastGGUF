@@ -2708,7 +2708,7 @@ static void gemm_kquant(tensor_t *t, int cols, int64_t rows, const q8k_blk_t *xk
     int nvec = (nb + GV - 1) / GV;
     size_t qoff = (size_t)g_gemm_cols + 64, soff = (size_t)g_gemm_cols / 16 + 1;
     int64_t nsteps = (rows + GEMM_NR - 1) / GEMM_NR;
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(guided, 2)
     for (int64_t st = 0; st < nsteps; st++) {
         int th = omp_get_thread_num();
         int64_t r = st * GEMM_NR;
@@ -2855,7 +2855,7 @@ static void gemm_q32(tensor_t *t, int cols, int64_t rows, const q8_blk_t *xq, si
     int nvec = (nb + GV - 1) / GV, nbl = cols / 32;
     size_t qoff = (size_t)g_gemm_cols + 64, soff = (size_t)g_gemm_cols / 16 + 1;
     int64_t nsteps = (rows + GEMM_NR - 1) / GEMM_NR;
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(guided, 2)
     for (int64_t st = 0; st < nsteps; st++) {
         int th = omp_get_thread_num();
         int64_t r = st * GEMM_NR;
