@@ -1074,35 +1074,70 @@ static inline float hsum128_ps(__m128 v) {
 }
 #endif
 
+#if defined(__AVX2__)
+// scale broadcast with one pshufb from a register holding all scales of a block (instead of
+// moving each scale from memory into a vector: 3 instructions on the shuffle port)
+// kshuf_w[i] puts 16-bit element i of each 128-bit lane into every word of that lane
+static const uint8_t kshuf_w[8][32] = {
+#define KSW(i) { 2*(i),2*(i)+1,2*(i),2*(i)+1,2*(i),2*(i)+1,2*(i),2*(i)+1,2*(i),2*(i)+1,2*(i),2*(i)+1,2*(i),2*(i)+1,2*(i),2*(i)+1, \
+                 2*(i),2*(i)+1,2*(i),2*(i)+1,2*(i),2*(i)+1,2*(i),2*(i)+1,2*(i),2*(i)+1,2*(i),2*(i)+1,2*(i),2*(i)+1,2*(i),2*(i)+1 }
+    KSW(0), KSW(1), KSW(2), KSW(3), KSW(4), KSW(5), KSW(6), KSW(7)
+#undef KSW
+};
+// low lane ← element 2k, high lane ← element 2k+1 (Q6_K: one scale per 16 values)
+static const uint8_t kshuf_q6[4][32] = {
+#define KS6(k) { 4*(k),4*(k)+1,4*(k),4*(k)+1,4*(k),4*(k)+1,4*(k),4*(k)+1,4*(k),4*(k)+1,4*(k),4*(k)+1,4*(k),4*(k)+1,4*(k),4*(k)+1, \
+                 4*(k)+2,4*(k)+3,4*(k)+2,4*(k)+3,4*(k)+2,4*(k)+3,4*(k)+2,4*(k)+3,4*(k)+2,4*(k)+3,4*(k)+2,4*(k)+3,4*(k)+2,4*(k)+3,4*(k)+2,4*(k)+3 }
+    KS6(0), KS6(1), KS6(2), KS6(3)
+#undef KS6
+};
+
+#endif
+
 static float dot_q4_K_q8k(const uint8_t *row, const q8k_blk_t *y, int nb) {
-    float sum = 0.0f;
 #if defined(__AVX2__)
     const __m256i m4 = _mm256_set1_epi8(0x0F);
+    const uint32_t k1 = 0x3f3f3f3f, k2 = 0x0f0f0f0f, k3 = 0x03030303;
     __m256 acc = _mm256_setzero_ps();
     __m128 macc = _mm_setzero_ps();
-#endif
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *p = row + b * 144, *qs = p + 16;
+        const int8_t *q8 = y[b].qs;
+        uint32_t u[4];
+        memcpy(u, p + 4, 12);
+        u[3] = ((u[2] >> 4) & k2) | (((u[1] >> 6) & k3) << 4);
+        uint32_t aux = u[1] & k1;
+        u[1] = (u[2] & k2) | (((u[0] >> 6) & k3) << 4);
+        u[2] = aux;
+        u[0] &= k1;
+        __m256i ms = _mm256_cvtepu8_epi16(_mm_set_epi32((int)u[3], (int)u[2], (int)u[1], (int)u[0]));
+        __m128i sc128 = _mm256_castsi256_si128(ms);
+        __m256i scales = _mm256_inserti128_si256(_mm256_castsi128_si256(sc128), sc128, 1);
+        __m256i sumi = _mm256_setzero_si256();
+        for (int j = 0; j < 4; j++) {
+            __m256i sl = _mm256_shuffle_epi8(scales, _mm256_loadu_si256((const __m256i *)kshuf_w[2 * j]));
+            __m256i sh = _mm256_shuffle_epi8(scales, _mm256_loadu_si256((const __m256i *)kshuf_w[2 * j + 1]));
+            __m256i q4 = _mm256_loadu_si256((const __m256i *)(qs + 32 * j));
+            __m256i lo = _mm256_and_si256(q4, m4);
+            __m256i hi = _mm256_and_si256(_mm256_srli_epi16(q4, 4), m4);
+            __m256i pl = _mm256_madd_epi16(sl, _mm256_maddubs_epi16(lo, _mm256_loadu_si256((const __m256i *)(q8 + 64 * j))));
+            __m256i ph = _mm256_madd_epi16(sh, _mm256_maddubs_epi16(hi, _mm256_loadu_si256((const __m256i *)(q8 + 64 * j + 32))));
+            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(pl, ph));
+        }
+        float yd = y[b].d;
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(FP16(rd_u16(p)) * yd), _mm256_cvtepi32_ps(sumi), acc);
+        macc = _mm_fmadd_ps(_mm_set1_ps(FP16(rd_u16(p + 2)) * yd),
+                            _mm_cvtepi32_ps(k4_min_vec(_mm256_extracti128_si256(ms, 1), &y[b])), macc);
+    }
+    return hsum_ps(acc) - hsum128_ps(macc);
+#else
+    float sum = 0.0f;
     for (int b = 0; b < nb; b++) {
         const uint8_t *p = row + b * 144, *qs = p + 16;
         const int8_t *q8 = y[b].qs;
         uint8_t sm[16];
         unpack_scales_k4(p + 4, sm);
         float yd = y[b].d;
-#if defined(__AVX2__)
-        __m256i sumi = _mm256_setzero_si256();
-        for (int j = 0; j < 4; j++) {     // 64 elements: low nibbles = sub-block 2j, high = 2j+1
-            __m256i q4 = _mm256_loadu_si256((const __m256i *)(qs + 32 * j));
-            __m256i lo = _mm256_and_si256(q4, m4);
-            __m256i hi = _mm256_and_si256(_mm256_srli_epi16(q4, 4), m4);
-            __m256i pl = _mm256_maddubs_epi16(lo, _mm256_loadu_si256((const __m256i *)(q8 + 64 * j)));
-            __m256i ph = _mm256_maddubs_epi16(hi, _mm256_loadu_si256((const __m256i *)(q8 + 64 * j + 32)));
-            pl = _mm256_madd_epi16(pl, _mm256_set1_epi16(sm[2 * j]));
-            ph = _mm256_madd_epi16(ph, _mm256_set1_epi16(sm[2 * j + 1]));
-            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(pl, ph));
-        }
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(FP16(rd_u16(p)) * yd), _mm256_cvtepi32_ps(sumi), acc);
-        __m128i mins16 = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *)(sm + 8)));
-        macc = _mm_fmadd_ps(_mm_set1_ps(FP16(rd_u16(p + 2)) * yd), _mm_cvtepi32_ps(k4_min_vec(mins16, &y[b])), macc);
-#else
         int sumi = 0;
         for (int j = 0; j < 4; j++) {
             int i1 = 0, i2 = 0;
@@ -1114,12 +1149,9 @@ static float dot_q4_K_q8k(const uint8_t *row, const q8k_blk_t *y, int nb) {
         }
         sum += FP16(rd_u16(p)) * yd * (float)sumi;
         sum -= FP16(rd_u16(p + 2)) * yd * (float)k4_min_sum(sm, &y[b]);
-#endif
     }
-#if defined(__AVX2__)
-    sum = hsum_ps(acc) - hsum128_ps(macc);
-#endif
     return sum;
+#endif
 }
 
 static float dot_q5_K_q8k(const uint8_t *row, const q8k_blk_t *y, int nb) {
@@ -1177,45 +1209,44 @@ static float dot_q5_K_q8k(const uint8_t *row, const q8k_blk_t *y, int nb) {
 }
 
 static float dot_q6_K_q8k(const uint8_t *row, const q8k_blk_t *y, int nb) {
-    float sum = 0.0f;
 #if defined(__AVX2__)
     const __m256i m4 = _mm256_set1_epi8(0x0F), m3 = _mm256_set1_epi8(3);
     __m256 acc = _mm256_setzero_ps();
-    __m128 cacc = _mm_setzero_ps();        // Σ_g sc_g · Σy_g  (the -32 offset)
-#endif
+    __m128 cacc = _mm_setzero_ps();
     for (int b = 0; b < nb; b++) {
         const uint8_t *p = row + b * 210;
-        const int8_t *sc = (const int8_t *)(p + 192);
         float dd = FP16(rd_u16(p + 208)) * y[b].d;
-#if defined(__AVX2__)
+        __m256i sc16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(p + 192)));
         __m256i sumi = _mm256_setzero_si256();
         for (int half = 0; half < 2; half++) {
             const uint8_t *ql = p + half * 64, *qh = p + 128 + half * 32;
-            const int8_t *s = sc + half * 8, *q8 = y[b].qs + half * 128;
+            const int8_t *q8 = y[b].qs + half * 128;
+            __m128i s8 = half ? _mm256_extracti128_si256(sc16, 1) : _mm256_castsi256_si128(sc16);
+            __m256i sv8 = _mm256_inserti128_si256(_mm256_castsi128_si256(s8), s8, 1);
             __m256i a0 = _mm256_loadu_si256((const __m256i *)ql);
             __m256i a1 = _mm256_loadu_si256((const __m256i *)(ql + 32));
             __m256i hh = _mm256_loadu_si256((const __m256i *)qh);
             __m256i q[4];
-            q[0] = _mm256_or_si256(_mm256_and_si256(a0, m4),
-                                   _mm256_slli_epi16(_mm256_and_si256(hh, m3), 4));
-            q[1] = _mm256_or_si256(_mm256_and_si256(a1, m4),
-                                   _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(hh, 2), m3), 4));
-            q[2] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(a0, 4), m4),
-                                   _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(hh, 4), m3), 4));
-            q[3] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(a1, 4), m4),
-                                   _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(hh, 6), m3), 4));
+            q[0] = _mm256_or_si256(_mm256_and_si256(a0, m4), _mm256_slli_epi16(_mm256_and_si256(hh, m3), 4));
+            q[1] = _mm256_or_si256(_mm256_and_si256(a1, m4), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(hh, 2), m3), 4));
+            q[2] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(a0, 4), m4), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(hh, 4), m3), 4));
+            q[3] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(a1, 4), m4), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(hh, 6), m3), 4));
             for (int k = 0; k < 4; k++) {
-                // scale per 16 elements: low half of the register uses s[2k], high half s[2k+1]
-                __m256i sv = _mm256_insertf128_si256(_mm256_castsi128_si256(_mm_set1_epi16(s[2 * k])),
-                                                     _mm_set1_epi16(s[2 * k + 1]), 1);
+                __m256i sv = _mm256_shuffle_epi8(sv8, _mm256_loadu_si256((const __m256i *)kshuf_q6[k]));
                 __m256i dt = _mm256_maddubs_epi16(q[k], _mm256_loadu_si256((const __m256i *)(q8 + 32 * k)));
                 sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(dt, sv));
             }
         }
         acc = _mm256_fmadd_ps(_mm256_set1_ps(dd), _mm256_cvtepi32_ps(sumi), acc);
-        __m256i sc16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)sc));
         cacc = _mm_fmadd_ps(_mm_set1_ps(dd * 32.0f), _mm_cvtepi32_ps(q6_corr_vec(sc16, &y[b])), cacc);
+    }
+    return hsum_ps(acc) - hsum128_ps(cacc);
 #else
+    float sum = 0.0f;
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *p = row + b * 210;
+        const int8_t *sc = (const int8_t *)(p + 192);
+        float dd = FP16(rd_u16(p + 208)) * y[b].d;
         int corr = 0;                      // Σ_g sc_g · Σy_g  (the -32 offset)
         for (int g = 0; g < 16; g++) corr += sc[g] * y[b].bsums[g];
         int sumi = 0;
@@ -1234,12 +1265,9 @@ static float dot_q6_K_q8k(const uint8_t *row, const q8k_blk_t *y, int nb) {
             }
         }
         sum += dd * (float)(sumi - 32 * corr);
-#endif
     }
-#if defined(__AVX2__)
-    sum = hsum_ps(acc) - hsum128_ps(cacc);
-#endif
     return sum;
+#endif
 }
 
 // -------------------------------------------------------------------------
@@ -2174,7 +2202,9 @@ static inline float dot_row(uint32_t type, int kind, const uint8_t *rb, const q8
 // walks its rows in order, but with compute between the loads the hardware prefetcher alone
 // leaves one core at ~5 GB/s; asking early more than doubles that (prefetches never fault, so
 // running past the end of the weights is harmless)
+#ifndef PF_DIST
 #define PF_DIST 2048
+#endif
 static inline void prefetch_ahead(const uint8_t *row, uint64_t n) {
 #if defined(__GNUC__)
     for (uint64_t c = 0; c < n; c += 64) __builtin_prefetch(row + PF_DIST + c, 0, 3);
