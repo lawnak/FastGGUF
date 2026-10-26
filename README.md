@@ -405,7 +405,7 @@ system message and the latest message are always kept).
 | `OMP_NUM_THREADS` | number | CPU threads (default: all) |
 | `FASTGGUF_BATCH` | `0` | read prompts token by token instead of in batches (same results up to float rounding, much slower; for troubleshooting) |
 | `FASTGGUF_CPU` | `avx512`, `avxvnni`, `avx2`, `sse2` | release downloads only: force one of the built-in kernel sets (default: the fastest your CPU supports) |
-| `FASTGGUF_REPACK` | `0` | do not re-arrange Q4_K weights at load time (less RAM, faster start, slower generation) |
+| `FASTGGUF_REPACK` | `0` | do not re-arrange Q4_K / Q4_0 weights at load time (less RAM, faster start, slower generation) |
 | `FASTGGUF_THP` | `0` | Linux: do not ask for 2 MB pages when mapping the model file (on by default; ~5 % faster generation on recent kernels) |
 
 Windows example: `set FASTGGUF_KV=turbo` then `fastgguf.exe chat model.gguf 16384`.
@@ -447,9 +447,9 @@ real model's, because speed depends only on the sizes and weight types.
 
 ## Limitations
 
-- Re-arranging the Q4_K weights for generation needs extra RAM about the size of those weights (the
+- Re-arranging the Q4_K / Q4_0 weights for generation needs extra RAM about the size of those weights (the
   file's own pages can be dropped by the OS) and a few seconds per GB at start-up; `FASTGGUF_REPACK=0`
-  turns it off. Only Q4_K is re-arranged so far. Gemma 4 models still read prompts token by token.
+  turns it off. Other weight types are not re-arranged. Gemma 4 models still read prompts token by token.
   No ARM NEON kernels yet.
 - The server handles one request at a time.
 - Text only: no images/audio, no tool calling / JSON mode, no embeddings endpoint.

@@ -272,7 +272,7 @@ typedef struct {
     const uint8_t *data;
     uint64_t nbytes;
     void *gpu;          // cl_mem — copy of the weights on the GPU (NULL = on the CPU)
-    const uint8_t *rp;  // the same weights re-arranged for the CPU kernels (Q4_K: q4kx8_t), or NULL
+    const uint8_t *rp;  // the same weights re-arranged for the CPU kernels (q4kx8_t / q40x8_t), or NULL
 } tensor_t;
 
 enum { KV_STR, KV_NUM, KV_INT_ARR, KV_STR_ARR };
@@ -2287,6 +2287,16 @@ static void unpack_row_q4Kx8(const q4kx8_t *grp, int k, int nb, uint8_t *q, floa
         float d = FP16(B->d[k]), dm = FP16(B->dmin[k]);
         for (int j = 0; j < 8; j++) wsc[8 * b + j] = d * B->sc[j][k];
         for (int p = 0; p < 4; p++) { wmn[8 * b + 2 * p] = dm * B->mn[p][k][0]; wmn[8 * b + 2 * p + 1] = dm * B->mn[p][k][1]; }
+#if defined(__AVX2__)
+        const __m256i m4 = _mm256_set1_epi8(0x0F);
+        for (int j = 0; j < 4; j++) {            // the row's 8 pieces = the file's 32 bytes of pair j
+            int32_t w[8];
+            for (int s = 0; s < 8; s++) memcpy(&w[s], B->qs[j][s][k], 4);
+            __m256i t = _mm256_loadu_si256((const __m256i *)w);
+            _mm256_storeu_si256((__m256i *)(q + 256 * b + 64 * j), _mm256_and_si256(t, m4));
+            _mm256_storeu_si256((__m256i *)(q + 256 * b + 64 * j + 32), _mm256_and_si256(_mm256_srli_epi16(t, 4), m4));
+        }
+#else
         for (int j = 0; j < 4; j++)
             for (int s = 0; s < 8; s++)
                 for (int i = 0; i < 4; i++) {
@@ -2294,6 +2304,7 @@ static void unpack_row_q4Kx8(const q4kx8_t *grp, int k, int nb, uint8_t *q, floa
                     q[256 * b + 64 * j + 4 * s + i] = v & 0x0F;
                     q[256 * b + 64 * j + 32 + 4 * s + i] = v >> 4;
                 }
+#endif
     }
 }
 
@@ -2368,6 +2379,93 @@ static void dot_q4Kx8(const q4kx8_t *B, const q8k_blk_t *y, const int32_t *bsp, 
 #endif
 }
 
+// Q4_0 the same way: per 32-value block, the 8 rows' scales, then 4 steps of 4 bytes per row (each
+// byte as in the file: low nibble = value 4s+i, high nibble = value 16+4s+i). 144 bytes for 8 rows,
+// the same as the file, so generation reads no extra bytes
+typedef struct {
+    uint16_t d[8];                   // fp16, one per row
+    uint8_t qs[4][8][4];             // [step s][row][i]
+} q40x8_t;
+
+static void repack_q40_group(const uint8_t *src, uint64_t stride, int nb, q40x8_t *dst) {
+    for (int b = 0; b < nb; b++)
+        for (int r = 0; r < 8; r++) {
+            const uint8_t *p = src + (uint64_t)r * stride + (uint64_t)b * 18;
+            dst[b].d[r] = rd_u16(p);
+            for (int s = 0; s < 4; s++) memcpy(dst[b].qs[s][r], p + 2 + 4 * s, 4);
+        }
+}
+
+// one row in natural order for the prompt GEMM, like unpack_row_q32 does for Q4_0
+static void unpack_row_q40x8(const q40x8_t *grp, int k, int nb, uint8_t *q, float *wsc, float *wmn) {
+    for (int b = 0; b < nb; b++) {
+        float d = FP16(grp[b].d[k]);
+        wsc[b] = d; wmn[b] = 8.0f * d;
+#if defined(__AVX2__)
+        // the row's 4-byte pieces put back together are the file's 16 bytes for this block
+        int32_t w[4];
+        for (int s = 0; s < 4; s++) memcpy(&w[s], grp[b].qs[s][k], 4);
+        __m128i t = _mm_loadu_si128((const __m128i *)w);
+        const __m128i m4 = _mm_set1_epi8(0x0F);
+        _mm_storeu_si128((__m128i *)(q + 32 * b), _mm_and_si128(t, m4));
+        _mm_storeu_si128((__m128i *)(q + 32 * b + 16), _mm_and_si128(_mm_srli_epi16(t, 4), m4));
+#else
+        for (int s = 0; s < 4; s++)
+            for (int i = 0; i < 4; i++) {
+                uint8_t v = grp[b].qs[s][k][i];
+                q[32 * b + 4 * s + i] = v & 0x0F;
+                q[32 * b + 16 + 4 * s + i] = v >> 4;
+            }
+#endif
+    }
+}
+
+// out[0..7] = dot(row r, y) for one group; the -8 offset is 8·Σy, the same for all 8 rows
+static void dot_q40x8(const q40x8_t *B, const q8_blk_t *y, int nb, float *out) {
+#if defined(__AVX2__)
+    const __m256i m4 = _mm256_set1_epi8(0x0F);
+    __m256 acc = _mm256_setzero_ps();
+    for (int b = 0; b < nb; b++, B++) {
+        __builtin_prefetch((const uint8_t *)B + PF_DIST, 0, 3);
+        __builtin_prefetch((const uint8_t *)B + PF_DIST + 64, 0, 3);
+        __builtin_prefetch((const uint8_t *)B + PF_DIST + 128, 0, 3);
+        __m256i ia[4];
+        for (int s = 0; s < 4; s++) {    // 4 short independent chains
+            __m256i v = _mm256_loadu_si256((const __m256i *)B->qs[s]);
+            int32_t a0, a1;
+            memcpy(&a0, y[b].qs + 4 * s, 4);
+            memcpy(&a1, y[b].qs + 16 + 4 * s, 4);
+            ia[s] = dp_u8s8_x8(dp_u8s8_x8(_mm256_setzero_si256(), _mm256_and_si256(v, m4), _mm256_set1_epi32(a0)),
+                               _mm256_and_si256(_mm256_srli_epi16(v, 4), m4), _mm256_set1_epi32(a1));
+        }
+        __m256i isum = _mm256_add_epi32(_mm256_add_epi32(ia[0], ia[1]), _mm256_add_epi32(ia[2], ia[3]));
+        isum = _mm256_sub_epi32(isum, _mm256_set1_epi32(8 * (y[b].s16[0] + y[b].s16[1])));
+#if defined(__F16C__)
+        __m256 d = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)B->d));
+#else
+        float df[8];
+        for (int r = 0; r < 8; r++) df[r] = FP16(B->d[r]);
+        __m256 d = _mm256_loadu_ps(df);
+#endif
+        acc = _mm256_fmadd_ps(_mm256_mul_ps(d, _mm256_set1_ps(y[b].d)), _mm256_cvtepi32_ps(isum), acc);
+    }
+    _mm256_storeu_ps(out, acc);
+#else
+    float acc[8] = {0};
+    for (int b = 0; b < nb; b++, B++)
+        for (int r = 0; r < 8; r++) {
+            int si = 0;
+            for (int s = 0; s < 4; s++)
+                for (int i = 0; i < 4; i++) {
+                    uint8_t v = B->qs[s][r][i];
+                    si += ((v & 0x0F) - 8) * y[b].qs[4 * s + i] + ((v >> 4) - 8) * y[b].qs[16 + 4 * s + i];
+                }
+            acc[r] += FP16(B->d[r]) * y[b].d * (float)si;
+        }
+    memcpy(out, acc, sizeof(acc));
+#endif
+}
+
 // memory for repacked weights: 2 MB aligned with huge pages where the OS offers them
 static void *alloc_weights(size_t n) {
 #ifdef _WIN32
@@ -2383,17 +2481,23 @@ static void *alloc_weights(size_t n) {
 #endif
 }
 
-// repack one tensor if it qualifies (Q4_K matrix on the CPU, rows a multiple of 8); returns bytes used
+// repack one tensor if it qualifies (Q4_K or Q4_0 matrix on the CPU, rows a multiple of 8); returns
+// the bytes used
 static uint64_t repack_tensor(tensor_t *t) {
-    if (!t || t->rp || t->gpu || t->type != T_Q4_K || t->n_dims != 2 || t->ne[0] % 256 || t->ne[1] % 8) return 0;
-    int nb = (int)(t->ne[0] / 256);
+    if (!t || t->rp || t->gpu || t->n_dims != 2 || t->ne[1] % 8) return 0;
+    int q4k = t->type == T_Q4_K && t->ne[0] % 256 == 0, q40 = t->type == T_Q4_0 && t->ne[0] % 32 == 0;
+    if (!q4k && !q40) return 0;
+    int nb = (int)(t->ne[0] / (q4k ? 256 : 32));
+    size_t gbytes = (size_t)nb * (q4k ? sizeof(q4kx8_t) : sizeof(q40x8_t));
     int64_t ng = (int64_t)t->ne[1] / 8;
-    uint64_t stride = row_stride(t->type, t->ne[0]), bytes = (uint64_t)ng * nb * sizeof(q4kx8_t);
-    q4kx8_t *dst = (q4kx8_t *)alloc_weights(bytes);
+    uint64_t stride = row_stride(t->type, t->ne[0]), bytes = (uint64_t)ng * gbytes;
+    uint8_t *dst = (uint8_t *)alloc_weights(bytes);
     if (!dst) return 0;
     #pragma omp parallel for schedule(static)
-    for (int64_t g = 0; g < ng; g++)
-        repack_q4K_group(t->data + (uint64_t)g * 8 * stride, stride, nb, dst + (size_t)g * nb);
+    for (int64_t g = 0; g < ng; g++) {
+        if (q4k) repack_q4K_group(t->data + (uint64_t)g * 8 * stride, stride, nb, (q4kx8_t *)(dst + (size_t)g * gbytes));
+        else     repack_q40_group(t->data + (uint64_t)g * 8 * stride, stride, nb, (q40x8_t *)(dst + (size_t)g * gbytes));
+    }
     t->rp = (const uint8_t *)dst;
 #if !defined(_WIN32) && defined(MADV_DONTNEED)
     // the file pages of this tensor are not read on the hot paths any more: drop them from this
@@ -2413,43 +2517,57 @@ static const int32_t *q4kx8_bsums_buf(const q8k_blk_t *xk, int nb) {
     return bsp;
 }
 
-// y = W·x for a repacked tensor (x already quantized to Q8_K in xk)
-static void matvec_q4Kx8(const tensor_t *t, const q8k_blk_t *xk, float *out) {
-    int nb = (int)(t->ne[0] / 256);
-    const int32_t *bsp = q4kx8_bsums_buf(xk, nb);
+// activations for a repacked tensor: Q8_K (+ the min-term sums) for Q4_K, Q8 for Q4_0
+static const int32_t *rp_quantize(const tensor_t *t, const float *x) {
+    int cols = (int)t->ne[0];
+    if (t->type == T_Q4_K) { quantize_q8k(x, g_xq8k, cols); return q4kx8_bsums_buf(g_xq8k, cols / 256); }
+    quantize_q8(x, g_xq8, cols);
+    return NULL;
+}
+
+// the 8 rows of group g of a repacked tensor
+static inline void rp_dot_group(const tensor_t *t, int64_t g, const int32_t *bsp, float *out) {
+    if (t->type == T_Q4_K) {
+        int nb = (int)(t->ne[0] / 256);
+        dot_q4Kx8((const q4kx8_t *)t->rp + (size_t)g * nb, g_xq8k, bsp, nb, out);
+    } else {
+        int nb = (int)(t->ne[0] / 32);
+        dot_q40x8((const q40x8_t *)t->rp + (size_t)g * nb, g_xq8, nb, out);
+    }
+}
+
+// y = W·x for a repacked tensor
+static void matvec_rp(const tensor_t *t, const float *x, float *out) {
+    const int32_t *bsp = rp_quantize(t, x);
     int64_t ng = (int64_t)t->ne[1] / 8;
-    const q4kx8_t *base = (const q4kx8_t *)t->rp;
     #pragma omp parallel for schedule(guided, 4)
-    for (int64_t g = 0; g < ng; g++)
-        dot_q4Kx8(base + (size_t)g * nb, xk, bsp, nb, out + 8 * g);
+    for (int64_t g = 0; g < ng; g++) rp_dot_group(t, g, bsp, out + 8 * g);
 }
 
 static int matvec(tensor_t *t, const float *x, float *out);
 
-// up to 4 matrices that read the same x (Q/K/V, FFN gate/up): the repacked ones run in one parallel
-// loop, so x is quantized once, there is one fork/join instead of several, and the small K/V
-// matrices share the threads with Q instead of running alone; the others go through matvec
+// up to 4 matrices that read the same x (Q/K/V, FFN gate/up): the repacked ones of the same type run
+// in one parallel loop, so x is quantized once, there is one fork/join instead of several, and the
+// small K/V matrices share the threads with Q instead of running alone; the others go through matvec
 static int matvec_multi(int n, tensor_t *const *t, const float *x, float *const *out) {
     tensor_t *f[4];
     float *fo[4];
     int nf = 0;
     for (int i = 0; i < n; i++) {
         if (!t[i]) continue;
-        if (n <= 4 && t[i]->rp && (nf == 0 || t[i]->ne[0] == f[0]->ne[0])) { f[nf] = t[i]; fo[nf++] = out[i]; }
-        else if (matvec(t[i], x, out[i]) != 0) return -1;
+        if (n <= 4 && t[i]->rp && (nf == 0 || (t[i]->ne[0] == f[0]->ne[0] && t[i]->type == f[0]->type))) {
+            f[nf] = t[i]; fo[nf++] = out[i];
+        } else if (matvec(t[i], x, out[i]) != 0) return -1;
     }
     if (nf == 0) return 0;
-    int cols = (int)f[0]->ne[0], nb = cols / 256;
-    quantize_q8k(x, g_xq8k, cols);
-    const int32_t *bsp = q4kx8_bsums_buf(g_xq8k, nb);
+    const int32_t *bsp = rp_quantize(f[0], x);
     int64_t first[5] = { 0 };
     for (int i = 0; i < nf; i++) first[i + 1] = first[i] + (int64_t)f[i]->ne[1] / 8;
     #pragma omp parallel for schedule(guided, 4)
     for (int64_t gg = 0; gg < first[nf]; gg++) {
         int i = 0;
         while (gg >= first[i + 1]) i++;
-        int64_t g = gg - first[i];
-        dot_q4Kx8((const q4kx8_t *)f[i]->rp + (size_t)g * nb, g_xq8k, bsp, nb, fo[i] + 8 * g);
+        rp_dot_group(f[i], gg - first[i], bsp, fo[i] + 8 * (gg - first[i]));
     }
     return 0;
 }
@@ -2467,9 +2585,8 @@ static int matvec(tensor_t *t, const float *x, float *out) {
     uint64_t stride = row_stride(t->type, (uint64_t)cols);
     const uint8_t *raw = t->data;
 
-    if (t->rp) {                  // repacked Q4_K: 8 rows per kernel call
-        quantize_q8k(x, g_xq8k, cols);
-        matvec_q4Kx8(t, g_xq8k, out);
+    if (t->rp) {                  // repacked Q4_K / Q4_0: 8 rows per kernel call
+        matvec_rp(t, x, out);
         return 0;
     }
     int use_q8 = type_uses_q8(t->type, cols);
@@ -2860,9 +2977,12 @@ static void gemm_q32(tensor_t *t, int cols, int64_t rows, const q8_blk_t *xq, si
         int th = omp_get_thread_num();
         int64_t r = st * GEMM_NR;
         int nr = rows - r < GEMM_NR ? (int)(rows - r) : GEMM_NR;
-        for (int k = 0; k < nr; k++)
-            unpack_row_q32(t->type, t->data + (uint64_t)(r + k) * stride, nbl,
-                           g_gq[th] + k * qoff, g_gsc[th] + k * soff, g_gmn[th] + k * soff);
+        for (int k = 0; k < nr; k++) {
+            if (t->rp) unpack_row_q40x8((const q40x8_t *)t->rp + (size_t)((r + k) / 8) * nbl, (int)((r + k) % 8), nbl,
+                                        g_gq[th] + k * qoff, g_gsc[th] + k * soff, g_gmn[th] + k * soff);
+            else unpack_row_q32(t->type, t->data + (uint64_t)(r + k) * stride, nbl,
+                                g_gq[th] + k * qoff, g_gsc[th] + k * soff, g_gmn[th] + k * soff);
+        }
         const uint8_t *q = g_gq[th];
         const float *sc = g_gsc[th], *mn = g_gmn[th];
         int c = 0;
@@ -4419,7 +4539,7 @@ static int model_load(model_t *m, gguf_t *g, int n_ctx) {
                    st + sm, st, sm);
     }
 
-    // CPU weights: Q4_K matrices re-arranged 8 rows side by side for the generation kernel
+    // CPU weights: Q4_K and Q4_0 matrices re-arranged 8 rows side by side for the generation kernels
     const char *rpenv = getenv("FASTGGUF_REPACK");
     if (!rpenv || strcmp(rpenv, "0") != 0) {
         double t0 = now_sec();
@@ -4432,7 +4552,7 @@ static int model_load(model_t *m, gguf_t *g, int n_ctx) {
         }
         uint64_t b = repack_tensor(m->output); rbytes += b; nrp += b > 0;
         if (nrp)
-            printf("[repack] %d Q4_K tensors (%.0f MB) arranged for the 8-row kernel in %.1fs\n",
+            printf("[repack] %d Q4_K / Q4_0 tensors (%.0f MB) arranged for the 8-row kernel in %.1fs\n",
                    nrp, rbytes / 1048576.0, now_sec() - t0);
     }
 
@@ -5662,6 +5782,45 @@ static int cmd_selftest(void) {
                umax == 0 ? "identical" : "DIFFERENT", ok ? "OK" : "FAIL");
         if (!ok) fails++;
         free(w); free(x); free(xk); free(rpk);
+    }
+
+    // --- repacked Q4_0: the same checks ---
+    {
+        int cols = 320, nbl = cols / 32, rows = 16;
+        uint64_t stride = (uint64_t)nbl * 18;
+        uint8_t *w = (uint8_t *)malloc(stride * rows);
+        for (uint64_t i = 0; i < stride * rows; i++) w[i] = (uint8_t)(rand() & 0xFF);
+        for (int b = 0; b < rows * nbl; b++) { uint16_t h = (uint16_t)(0x2C00 + (rand() & 0x3FF)); memcpy(w + (size_t)b * 18, &h, 2); }
+        float *x = (float *)malloc(cols * sizeof(float)), out[16];
+        for (int i = 0; i < cols; i++) x[i] = (float)(rand() % 2000 - 1000) / 500.0f;
+        q8_blk_t *xq = (q8_blk_t *)malloc(nbl * sizeof(q8_blk_t));
+        quantize_q8(x, xq, cols);
+        q40x8_t *rpk = (q40x8_t *)malloc((size_t)2 * nbl * sizeof(q40x8_t));
+        for (int g = 0; g < 2; g++) {
+            repack_q40_group(w + (uint64_t)g * 8 * stride, stride, nbl, rpk + g * nbl);
+            dot_q40x8(rpk + g * nbl, xq, nbl, out + 8 * g);
+        }
+        double emax = 0, ymax = 0;
+        int udiff = 0;
+        for (int r = 0; r < rows; r++) {
+            float ref = dot_q4_0_q8(w + (uint64_t)r * stride, xq, nbl);
+            if (fabs(ref - out[r]) > emax) emax = fabs(ref - out[r]);
+            if (fabs(ref) > ymax) ymax = fabs(ref);
+#if defined(__AVX2__)
+            uint8_t qa[320], qb[320];
+            float sa[10], sb2[10], ma[10], mb[10];
+            unpack_row_q32(T_Q4_0, w + (uint64_t)r * stride, nbl, qa, sa, ma);
+            unpack_row_q40x8(rpk + (r / 8) * nbl, r % 8, nbl, qb, sb2, mb);
+            if (memcmp(qa, qb, sizeof(qa)) != 0) udiff = 1;
+            for (int i = 0; i < nbl; i++) if (sa[i] != sb2[i] || ma[i] != mb[i]) udiff = 1;
+#endif
+        }
+        double rel = emax / (ymax + 1e-9);
+        int ok = rel < 1e-5 && !udiff;
+        printf("Q4_0  repacked 8-row kernel vs single: rel_err=%.2e, GEMM unpack %s %s\n", rel,
+               udiff ? "DIFFERENT" : "identical", ok ? "OK" : "FAIL");
+        if (!ok) fails++;
+        free(w); free(x); free(xq); free(rpk);
     }
 
     // --- attention rows (QK tiles, softmax, value sum) against a plain double computation; ring
