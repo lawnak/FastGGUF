@@ -4,135 +4,135 @@
     "generation": "48 tokens after a 16-token context, 4 threads (llama.cpp: llama-bench -p 0 -n 48 -d 16)",
     "long": "48 tokens after 1500 tokens of context (llama-bench -p 0 -n 48 -d 1500)",
     "prompt": "512-token prompt (llama-bench -p 512 -n 0)",
-    "runs": "fastgguf best of 3, llama.cpp mean of 3"
+    "runs": "fastgguf best of 3, llama.cpp mean of 3; both engines measured back to back for each model"
   },
   "rows": [
     {
       "model": "qwen2.5-0.5b-q4_0",
       "gb": 0.281,
-      "fastgguf": 68.61,
-      "llamacpp": 52.0,
-      "prompt_fastgguf": 532.7,
-      "prompt_llamacpp": 455.7,
-      "long_fastgguf": 65.41,
-      "long_llamacpp": 42.4
+      "fastgguf": 106.87,
+      "llamacpp": 117.6,
+      "prompt_fastgguf": 766.0,
+      "prompt_llamacpp": 595.2,
+      "long_fastgguf": 89.15,
+      "long_llamacpp": 77.5
     },
     {
       "model": "qwen2.5-0.5b-q8_0",
       "gb": 0.528,
-      "fastgguf": 44.18,
-      "llamacpp": 37.2,
-      "prompt_fastgguf": 509.1,
-      "prompt_llamacpp": 304.2,
-      "long_fastgguf": 43.44,
-      "long_llamacpp": 29.5
+      "fastgguf": 69.76,
+      "llamacpp": 54.2,
+      "prompt_fastgguf": 728.4,
+      "prompt_llamacpp": 398.7,
+      "long_fastgguf": 70.75,
+      "long_llamacpp": 43.1
     },
     {
       "model": "qwen2.5-0.5b-q4_k_m",
       "gb": 0.395,
-      "fastgguf": 54.75,
-      "llamacpp": 35.1,
-      "prompt_fastgguf": 494.7,
-      "prompt_llamacpp": 316.6,
-      "long_fastgguf": 53.87,
-      "long_llamacpp": 33.5
+      "fastgguf": 86.95,
+      "llamacpp": 55.2,
+      "prompt_fastgguf": 733.5,
+      "prompt_llamacpp": 451.4,
+      "long_fastgguf": 71.41,
+      "long_llamacpp": 47.1
     },
     {
       "model": "llama-3.2-1b-q4_0",
       "gb": 0.698,
-      "fastgguf": 27.04,
-      "llamacpp": 25.0,
-      "prompt_fastgguf": 209.4,
-      "prompt_llamacpp": 181.7,
-      "long_fastgguf": 25.17,
-      "long_llamacpp": 19.1
+      "fastgguf": 40.94,
+      "llamacpp": 39.7,
+      "prompt_fastgguf": 349.7,
+      "prompt_llamacpp": 245.4,
+      "long_fastgguf": 32.6,
+      "long_llamacpp": 26.9
     },
     {
       "model": "llama-3.2-1b-q8_0",
       "gb": 1.316,
-      "fastgguf": 21.07,
-      "llamacpp": 15.7,
-      "prompt_fastgguf": 197.5,
-      "prompt_llamacpp": 124.5,
-      "long_fastgguf": 20.42,
-      "long_llamacpp": 13.5
+      "fastgguf": 24.31,
+      "llamacpp": 21.3,
+      "prompt_fastgguf": 327.7,
+      "prompt_llamacpp": 174.6,
+      "long_fastgguf": 24.92,
+      "long_llamacpp": 18.8
     },
     {
       "model": "llama-3.2-1b-q4_k_m",
       "gb": 0.803,
-      "fastgguf": 27.06,
-      "llamacpp": 25.3,
-      "prompt_fastgguf": 187.1,
-      "prompt_llamacpp": 206.8,
-      "long_fastgguf": 23.95,
-      "long_llamacpp": 19.2
+      "fastgguf": 37.13,
+      "llamacpp": 35.9,
+      "prompt_fastgguf": 332.7,
+      "prompt_llamacpp": 290.5,
+      "long_fastgguf": 31.43,
+      "long_llamacpp": 28.2
     },
     {
       "model": "gemma-3-1b-q4_k_m",
       "gb": 0.806,
-      "fastgguf": 25.47,
-      "llamacpp": 19.5,
-      "prompt_fastgguf": 211.4,
-      "prompt_llamacpp": 169.0,
-      "long_fastgguf": 24.63,
-      "long_llamacpp": 18.7
+      "fastgguf": 33.13,
+      "llamacpp": 24.6,
+      "prompt_fastgguf": 312.2,
+      "prompt_llamacpp": 234.2,
+      "long_fastgguf": 34.49,
+      "long_llamacpp": 24.2
     },
     {
       "model": "qwen2.5-1.5b-q4_k_m",
       "gb": 0.983,
-      "fastgguf": 20.83,
-      "llamacpp": 21.8,
-      "prompt_fastgguf": 127.3,
-      "prompt_llamacpp": 139.7,
-      "long_fastgguf": 20.73,
-      "long_llamacpp": 18.2
+      "fastgguf": 30.2,
+      "llamacpp": 27.6,
+      "prompt_fastgguf": 241.7,
+      "prompt_llamacpp": 199.6,
+      "long_fastgguf": 29.06,
+      "long_llamacpp": 24.2
     },
     {
       "model": "llama-3.2-3b-q4_k_m",
       "gb": 2.014,
-      "fastgguf": 10.72,
-      "llamacpp": 11.3,
-      "prompt_fastgguf": 64.7,
-      "prompt_llamacpp": 75.3,
-      "long_fastgguf": 9.12,
-      "long_llamacpp": 7.6
+      "fastgguf": 12.92,
+      "llamacpp": 14.0,
+      "prompt_fastgguf": 116.3,
+      "prompt_llamacpp": 96.5,
+      "long_fastgguf": 11.88,
+      "long_llamacpp": 10.1
     },
     {
       "model": "qwen3-4b-q4_k_m",
       "gb": 2.495,
-      "fastgguf": 8.04,
-      "llamacpp": 9.1,
-      "prompt_fastgguf": 49.4,
-      "prompt_llamacpp": 53.4,
-      "long_fastgguf": 6.87,
-      "long_llamacpp": 6.0
+      "fastgguf": 9.61,
+      "llamacpp": 11.4,
+      "prompt_fastgguf": 87.5,
+      "prompt_llamacpp": 71.2,
+      "long_fastgguf": 8.42,
+      "long_llamacpp": 7.5
     },
     {
       "model": "llama-3.1-8b-q4_k_m",
       "gb": 4.916,
-      "fastgguf": 4.59,
-      "llamacpp": 5.2,
-      "prompt_fastgguf": 26.7,
-      "prompt_llamacpp": 29.8,
-      "long_fastgguf": 4.19,
-      "long_llamacpp": 4.1
+      "fastgguf": 5.96,
+      "llamacpp": 6.4,
+      "prompt_fastgguf": 52.1,
+      "prompt_llamacpp": 41.3,
+      "long_fastgguf": 5.34,
+      "long_llamacpp": 5.3
     }
   ],
   "threads": [
     {
       "threads": 1,
-      "fastgguf": 10.1,
-      "llamacpp": 7.7
+      "fastgguf": 13.57,
+      "llamacpp": 10.7
     },
     {
       "threads": 2,
-      "fastgguf": 17.4,
-      "llamacpp": 14.2
+      "fastgguf": 23.3,
+      "llamacpp": 19.6
     },
     {
       "threads": 4,
-      "fastgguf": 27.5,
-      "llamacpp": 25.6
+      "fastgguf": 37.69,
+      "llamacpp": 35.1
     }
   ]
 }

@@ -23,84 +23,88 @@
   <rect class="s1" x="24" y="68" width="12" height="12" rx="3"/><text class="sub" x="42" y="79">fastgguf</text>
   <rect class="s2" x="112" y="68" width="12" height="12" rx="3"/><text class="sub" x="130" y="79">llama.cpp (CPU)</text>
   <text class="tick" x="250.0" y="620" text-anchor="middle">0</text>
-  <line class="grid" x1="363.3" y1="90" x2="363.3" y2="602"/>
-  <text class="tick" x="363.3" y="620" text-anchor="middle">100</text>
-  <line class="grid" x1="476.7" y1="90" x2="476.7" y2="602"/>
-  <text class="tick" x="476.7" y="620" text-anchor="middle">200</text>
+  <line class="grid" x1="335.0" y1="90" x2="335.0" y2="602"/>
+  <text class="tick" x="335.0" y="620" text-anchor="middle">100</text>
+  <line class="grid" x1="420.0" y1="90" x2="420.0" y2="602"/>
+  <text class="tick" x="420.0" y="620" text-anchor="middle">200</text>
+  <line class="grid" x1="505.0" y1="90" x2="505.0" y2="602"/>
+  <text class="tick" x="505.0" y="620" text-anchor="middle">300</text>
   <line class="grid" x1="590.0" y1="90" x2="590.0" y2="602"/>
-  <text class="tick" x="590.0" y="620" text-anchor="middle">300</text>
-  <line class="grid" x1="703.3" y1="90" x2="703.3" y2="602"/>
-  <text class="tick" x="703.3" y="620" text-anchor="middle">400</text>
-  <line class="grid" x1="816.7" y1="90" x2="816.7" y2="602"/>
-  <text class="tick" x="816.7" y="620" text-anchor="middle">500</text>
+  <text class="tick" x="590.0" y="620" text-anchor="middle">400</text>
+  <line class="grid" x1="675.0" y1="90" x2="675.0" y2="602"/>
+  <text class="tick" x="675.0" y="620" text-anchor="middle">500</text>
+  <line class="grid" x1="760.0" y1="90" x2="760.0" y2="602"/>
+  <text class="tick" x="760.0" y="620" text-anchor="middle">600</text>
+  <line class="grid" x1="845.0" y1="90" x2="845.0" y2="602"/>
+  <text class="tick" x="845.0" y="620" text-anchor="middle">700</text>
   <line class="grid" x1="930.0" y1="90" x2="930.0" y2="602"/>
-  <text class="tick" x="930.0" y="620" text-anchor="middle">600</text>
+  <text class="tick" x="930.0" y="620" text-anchor="middle">800</text>
   <text class="lab" x="236" y="114.0" text-anchor="end">Qwen2.5 0.5B</text>
   <text class="lab2" x="236" y="130.0" text-anchor="end">Q4_0 · 0.28 GB</text>
-  <path class="s1" d="M250.0,102.0 H849.7 Q853.7,102.0 853.7,106.0 V112.0 Q853.7,116.0 849.7,116.0 H250.0 Z"/>
-  <text class="val" x="859.7" y="113.0">532.7</text>
-  <path class="s2" d="M250.0,118.0 H762.5 Q766.5,118.0 766.5,122.0 V128.0 Q766.5,132.0 762.5,132.0 H250.0 Z"/>
-  <text class="val" x="772.5" y="129.0">455.7</text>
+  <path class="s1" d="M250.0,102.0 H897.1 Q901.1,102.0 901.1,106.0 V112.0 Q901.1,116.0 897.1,116.0 H250.0 Z"/>
+  <text class="val" x="907.1" y="113.0">766.0</text>
+  <path class="s2" d="M250.0,118.0 H751.9 Q755.9,118.0 755.9,122.0 V128.0 Q755.9,132.0 751.9,132.0 H250.0 Z"/>
+  <text class="val" x="761.9" y="129.0">595.2</text>
   <text class="lab" x="236" y="160.0" text-anchor="end">Qwen2.5 0.5B</text>
   <text class="lab2" x="236" y="176.0" text-anchor="end">Q8_0 · 0.53 GB</text>
-  <path class="s1" d="M250.0,148.0 H823.0 Q827.0,148.0 827.0,152.0 V158.0 Q827.0,162.0 823.0,162.0 H250.0 Z"/>
-  <text class="val" x="833.0" y="159.0">509.1</text>
-  <path class="s2" d="M250.0,164.0 H590.8 Q594.8,164.0 594.8,168.0 V174.0 Q594.8,178.0 590.8,178.0 H250.0 Z"/>
-  <text class="val" x="600.8" y="175.0">304.2</text>
+  <path class="s1" d="M250.0,148.0 H865.1 Q869.1,148.0 869.1,152.0 V158.0 Q869.1,162.0 865.1,162.0 H250.0 Z"/>
+  <text class="val" x="875.1" y="159.0">728.4</text>
+  <path class="s2" d="M250.0,164.0 H584.9 Q588.9,164.0 588.9,168.0 V174.0 Q588.9,178.0 584.9,178.0 H250.0 Z"/>
+  <text class="val" x="594.9" y="175.0">398.7</text>
   <text class="lab" x="236" y="206.0" text-anchor="end">Qwen2.5 0.5B</text>
   <text class="lab2" x="236" y="222.0" text-anchor="end">Q4_K_M · 0.40 GB</text>
-  <path class="s1" d="M250.0,194.0 H806.7 Q810.7,194.0 810.7,198.0 V204.0 Q810.7,208.0 806.7,208.0 H250.0 Z"/>
-  <text class="val" x="816.7" y="205.0">494.7</text>
-  <path class="s2" d="M250.0,210.0 H604.8 Q608.8,210.0 608.8,214.0 V220.0 Q608.8,224.0 604.8,224.0 H250.0 Z"/>
-  <text class="val" x="614.8" y="221.0">316.6</text>
+  <path class="s1" d="M250.0,194.0 H869.5 Q873.5,194.0 873.5,198.0 V204.0 Q873.5,208.0 869.5,208.0 H250.0 Z"/>
+  <text class="val" x="879.5" y="205.0">733.5</text>
+  <path class="s2" d="M250.0,210.0 H629.7 Q633.7,210.0 633.7,214.0 V220.0 Q633.7,224.0 629.7,224.0 H250.0 Z"/>
+  <text class="val" x="639.7" y="221.0">451.4</text>
   <text class="lab" x="236" y="252.0" text-anchor="end">Llama 3.2 1B</text>
   <text class="lab2" x="236" y="268.0" text-anchor="end">Q4_0 · 0.70 GB</text>
-  <path class="s1" d="M250.0,240.0 H483.3 Q487.3,240.0 487.3,244.0 V250.0 Q487.3,254.0 483.3,254.0 H250.0 Z"/>
-  <text class="val" x="493.3" y="251.0">209.4</text>
-  <path class="s2" d="M250.0,256.0 H451.9 Q455.9,256.0 455.9,260.0 V266.0 Q455.9,270.0 451.9,270.0 H250.0 Z"/>
-  <text class="val" x="461.9" y="267.0">181.7</text>
+  <path class="s1" d="M250.0,240.0 H543.2 Q547.2,240.0 547.2,244.0 V250.0 Q547.2,254.0 543.2,254.0 H250.0 Z"/>
+  <text class="val" x="553.2" y="251.0">349.7</text>
+  <path class="s2" d="M250.0,256.0 H454.6 Q458.6,256.0 458.6,260.0 V266.0 Q458.6,270.0 454.6,270.0 H250.0 Z"/>
+  <text class="val" x="464.6" y="267.0">245.4</text>
   <text class="lab" x="236" y="298.0" text-anchor="end">Llama 3.2 1B</text>
   <text class="lab2" x="236" y="314.0" text-anchor="end">Q8_0 · 1.32 GB</text>
-  <path class="s1" d="M250.0,286.0 H469.8 Q473.8,286.0 473.8,290.0 V296.0 Q473.8,300.0 469.8,300.0 H250.0 Z"/>
-  <text class="val" x="479.8" y="297.0">197.5</text>
-  <path class="s2" d="M250.0,302.0 H387.1 Q391.1,302.0 391.1,306.0 V312.0 Q391.1,316.0 387.1,316.0 H250.0 Z"/>
-  <text class="val" x="397.1" y="313.0">124.5</text>
+  <path class="s1" d="M250.0,286.0 H524.5 Q528.5,286.0 528.5,290.0 V296.0 Q528.5,300.0 524.5,300.0 H250.0 Z"/>
+  <text class="val" x="534.5" y="297.0">327.7</text>
+  <path class="s2" d="M250.0,302.0 H394.4 Q398.4,302.0 398.4,306.0 V312.0 Q398.4,316.0 394.4,316.0 H250.0 Z"/>
+  <text class="val" x="404.4" y="313.0">174.6</text>
   <text class="lab" x="236" y="344.0" text-anchor="end">Llama 3.2 1B</text>
   <text class="lab2" x="236" y="360.0" text-anchor="end">Q4_K_M · 0.80 GB</text>
-  <path class="s1" d="M250.0,332.0 H458.0 Q462.0,332.0 462.0,336.0 V342.0 Q462.0,346.0 458.0,346.0 H250.0 Z"/>
-  <text class="val" x="468.0" y="343.0">187.1</text>
-  <path class="s2" d="M250.0,348.0 H480.4 Q484.4,348.0 484.4,352.0 V358.0 Q484.4,362.0 480.4,362.0 H250.0 Z"/>
-  <text class="val" x="490.4" y="359.0">206.8</text>
+  <path class="s1" d="M250.0,332.0 H528.8 Q532.8,332.0 532.8,336.0 V342.0 Q532.8,346.0 528.8,346.0 H250.0 Z"/>
+  <text class="val" x="538.8" y="343.0">332.7</text>
+  <path class="s2" d="M250.0,348.0 H492.9 Q496.9,348.0 496.9,352.0 V358.0 Q496.9,362.0 492.9,362.0 H250.0 Z"/>
+  <text class="val" x="502.9" y="359.0">290.5</text>
   <text class="lab" x="236" y="390.0" text-anchor="end">Gemma 3 1B</text>
   <text class="lab2" x="236" y="406.0" text-anchor="end">Q4_K_M · 0.81 GB</text>
-  <path class="s1" d="M250.0,378.0 H485.6 Q489.6,378.0 489.6,382.0 V388.0 Q489.6,392.0 485.6,392.0 H250.0 Z"/>
-  <text class="val" x="495.6" y="389.0">211.4</text>
-  <path class="s2" d="M250.0,394.0 H437.5 Q441.5,394.0 441.5,398.0 V404.0 Q441.5,408.0 437.5,408.0 H250.0 Z"/>
-  <text class="val" x="447.5" y="405.0">169.0</text>
+  <path class="s1" d="M250.0,378.0 H511.4 Q515.4,378.0 515.4,382.0 V388.0 Q515.4,392.0 511.4,392.0 H250.0 Z"/>
+  <text class="val" x="521.4" y="389.0">312.2</text>
+  <path class="s2" d="M250.0,394.0 H445.1 Q449.1,394.0 449.1,398.0 V404.0 Q449.1,408.0 445.1,408.0 H250.0 Z"/>
+  <text class="val" x="455.1" y="405.0">234.2</text>
   <text class="lab" x="236" y="436.0" text-anchor="end">Qwen2.5 1.5B</text>
   <text class="lab2" x="236" y="452.0" text-anchor="end">Q4_K_M · 0.98 GB</text>
-  <path class="s1" d="M250.0,424.0 H390.3 Q394.3,424.0 394.3,428.0 V434.0 Q394.3,438.0 390.3,438.0 H250.0 Z"/>
-  <text class="val" x="400.3" y="435.0">127.3</text>
-  <path class="s2" d="M250.0,440.0 H404.3 Q408.3,440.0 408.3,444.0 V450.0 Q408.3,454.0 404.3,454.0 H250.0 Z"/>
-  <text class="val" x="414.3" y="451.0">139.7</text>
+  <path class="s1" d="M250.0,424.0 H451.4 Q455.4,424.0 455.4,428.0 V434.0 Q455.4,438.0 451.4,438.0 H250.0 Z"/>
+  <text class="val" x="461.4" y="435.0">241.7</text>
+  <path class="s2" d="M250.0,440.0 H415.7 Q419.7,440.0 419.7,444.0 V450.0 Q419.7,454.0 415.7,454.0 H250.0 Z"/>
+  <text class="val" x="425.7" y="451.0">199.6</text>
   <text class="lab" x="236" y="482.0" text-anchor="end">Llama 3.2 3B</text>
   <text class="lab2" x="236" y="498.0" text-anchor="end">Q4_K_M · 2.01 GB</text>
-  <path class="s1" d="M250.0,470.0 H319.3 Q323.3,470.0 323.3,474.0 V480.0 Q323.3,484.0 319.3,484.0 H250.0 Z"/>
-  <text class="val" x="329.3" y="481.0">64.7</text>
-  <path class="s2" d="M250.0,486.0 H331.3 Q335.3,486.0 335.3,490.0 V496.0 Q335.3,500.0 331.3,500.0 H250.0 Z"/>
-  <text class="val" x="341.3" y="497.0">75.3</text>
+  <path class="s1" d="M250.0,470.0 H344.9 Q348.9,470.0 348.9,474.0 V480.0 Q348.9,484.0 344.9,484.0 H250.0 Z"/>
+  <text class="val" x="354.9" y="481.0">116.3</text>
+  <path class="s2" d="M250.0,486.0 H328.0 Q332.0,486.0 332.0,490.0 V496.0 Q332.0,500.0 328.0,500.0 H250.0 Z"/>
+  <text class="val" x="338.0" y="497.0">96.5</text>
   <text class="lab" x="236" y="528.0" text-anchor="end">Qwen3 4B</text>
   <text class="lab2" x="236" y="544.0" text-anchor="end">Q4_K_M · 2.50 GB</text>
-  <path class="s1" d="M250.0,516.0 H302.0 Q306.0,516.0 306.0,520.0 V526.0 Q306.0,530.0 302.0,530.0 H250.0 Z"/>
-  <text class="val" x="312.0" y="527.0">49.4</text>
+  <path class="s1" d="M250.0,516.0 H320.4 Q324.4,516.0 324.4,520.0 V526.0 Q324.4,530.0 320.4,530.0 H250.0 Z"/>
+  <text class="val" x="330.4" y="527.0">87.5</text>
   <path class="s2" d="M250.0,532.0 H306.5 Q310.5,532.0 310.5,536.0 V542.0 Q310.5,546.0 306.5,546.0 H250.0 Z"/>
-  <text class="val" x="316.5" y="543.0">53.4</text>
+  <text class="val" x="316.5" y="543.0">71.2</text>
   <text class="lab" x="236" y="574.0" text-anchor="end">Llama 3.1 8B</text>
   <text class="lab2" x="236" y="590.0" text-anchor="end">Q4_K_M · 4.92 GB</text>
-  <path class="s1" d="M250.0,562.0 H276.3 Q280.3,562.0 280.3,566.0 V572.0 Q280.3,576.0 276.3,576.0 H250.0 Z"/>
-  <text class="val" x="286.3" y="573.0">26.7</text>
-  <path class="s2" d="M250.0,578.0 H279.8 Q283.8,578.0 283.8,582.0 V588.0 Q283.8,592.0 279.8,592.0 H250.0 Z"/>
-  <text class="val" x="289.8" y="589.0">29.8</text>
+  <path class="s1" d="M250.0,562.0 H290.3 Q294.3,562.0 294.3,566.0 V572.0 Q294.3,576.0 290.3,576.0 H250.0 Z"/>
+  <text class="val" x="300.3" y="573.0">52.1</text>
+  <path class="s2" d="M250.0,578.0 H281.1 Q285.1,578.0 285.1,582.0 V588.0 Q285.1,592.0 281.1,592.0 H250.0 Z"/>
+  <text class="val" x="291.1" y="589.0">41.3</text>
   <line class="base" x1="250" y1="90" x2="250" y2="602"/>
   <text class="tick" x="590" y="640" text-anchor="middle">tokens per second</text>
 </svg>

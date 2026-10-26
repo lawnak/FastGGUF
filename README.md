@@ -46,7 +46,7 @@ NVIDIA, AMD or Intel graphics card through OpenCL when one is present.
 | **Fast CPU kernels** | Integer dot products with AVX2 / AVX-VNNI / AVX-512 VNNI, all cores via OpenMP. Works without AVX2 too (portable C path). |
 | **Mixture-of-Experts** | Qwen3 MoE models. Experts are read from disk only when the router picks them, so a model larger than your RAM can still run. |
 | **TurboQuant KV cache** | Optional compressed attention cache (`FASTGGUF_KV=turbo`): 5–9× less memory for long conversations, with a Hadamard rotation that keeps accuracy. |
-| **Batched prompt reading** | The message is processed in batches of up to 64 tokens with an int8 matrix-multiply (VNNI where available) and tiled attention, 7–9× faster than token by token; results agree with token-by-token up to float rounding. |
+| **Batched prompt reading** | The message is processed in batches of up to 64 tokens with an int8 matrix-multiply (VNNI where available) and tiled attention, 8–9× faster than token by token; results agree with token-by-token up to float rounding. |
 | **Prompt cache reuse** | The server keeps the previous conversation in the KV cache and only processes the new part of each request. |
 | **Sampling controls** | temperature, top-k, top-p, repeat penalty, seed (reproducible replies), greedy mode. |
 | **Unicode everywhere** | Arabic, CJK and emoji are printed correctly, including on the Windows console and in file paths. |
@@ -233,58 +233,56 @@ random values, so anyone can reproduce the numbers without downloading anything.
 
 | Model | Weights | File | Prompt (512 tokens) fastgguf / llama.cpp | Generation fastgguf / llama.cpp | Generation at 1,500 context |
 |---|---|---|---|---|---|
-| Qwen2.5 0.5B | Q4_0 | 0.28 GB | **533** / 456 | **68.6** / 52.0 | **65.4** / 42.4 |
-| Qwen2.5 0.5B | Q8_0 | 0.53 GB | **509** / 304 | **44.2** / 37.2 | **43.4** / 29.5 |
-| Qwen2.5 0.5B | Q4_K_M | 0.40 GB | **495** / 317 | **54.8** / 35.1 | **53.9** / 33.5 |
-| Llama 3.2 1B | Q4_0 | 0.70 GB | **209** / 182 | **27.0** / 25.0 | **25.2** / 19.1 |
-| Llama 3.2 1B | Q8_0 | 1.32 GB | **198** / 125 | **21.1** / 15.7 | **20.4** / 13.5 |
-| Llama 3.2 1B | Q4_K_M | 0.80 GB | 187 / **207** | **27.1** / 25.3 | **24.0** / 19.2 |
-| Gemma 3 1B | Q4_K_M | 0.81 GB | **211** / 169 | **25.5** / 19.5 | **24.6** / 18.7 |
-| Qwen2.5 1.5B | Q4_K_M | 0.98 GB | 127 / **140** | 20.8 / **21.8** | **20.7** / 18.2 |
-| Llama 3.2 3B | Q4_K_M | 2.01 GB | 65 / **75** | 10.7 / **11.3** | **9.1** / 7.6 |
-| Qwen3 4B | Q4_K_M | 2.50 GB | 49 / **53** | 8.0 / **9.1** | **6.9** / 6.0 |
-| Llama 3.1 8B | Q4_K_M | 4.92 GB | 27 / **30** | 4.6 / **5.2** | **4.2** / 4.1 |
+| Qwen2.5 0.5B | Q4_0 | 0.28 GB | **766** / 595 | 106.9 / **117.6** | **89.2** / 77.5 |
+| Qwen2.5 0.5B | Q8_0 | 0.53 GB | **728** / 399 | **69.8** / 54.2 | **70.8** / 43.1 |
+| Qwen2.5 0.5B | Q4_K_M | 0.40 GB | **734** / 451 | **87.0** / 55.2 | **71.4** / 47.1 |
+| Llama 3.2 1B | Q4_0 | 0.70 GB | **350** / 245 | **40.9** / 39.7 | **32.6** / 26.9 |
+| Llama 3.2 1B | Q8_0 | 1.32 GB | **328** / 175 | **24.3** / 21.3 | **24.9** / 18.8 |
+| Llama 3.2 1B | Q4_K_M | 0.80 GB | **333** / 290 | **37.1** / 35.9 | **31.4** / 28.2 |
+| Gemma 3 1B | Q4_K_M | 0.81 GB | **312** / 234 | **33.1** / 24.6 | **34.5** / 24.2 |
+| Qwen2.5 1.5B | Q4_K_M | 0.98 GB | **242** / 200 | **30.2** / 27.6 | **29.1** / 24.2 |
+| Llama 3.2 3B | Q4_K_M | 2.01 GB | **116** / 96 | 12.9 / **14.0** | **11.9** / 10.1 |
+| Qwen3 4B | Q4_K_M | 2.50 GB | **88** / 71 | 9.6 / **11.4** | **8.4** / 7.5 |
+| Llama 3.1 8B | Q4_K_M | 4.92 GB | **52** / 41 | 6.0 / **6.4** | 5.3 / 5.3 |
 
-All numbers are tokens per second; the faster engine is in bold.
+All numbers are tokens per second; the faster engine is in bold. The VM's speed drifts over the day
+(the same binary can measure 30 % faster an hour later), so each model was measured with both engines
+back to back, in one run.
 
 **What the numbers say**
 
-- **Models below 1.5B:** fastgguf generates faster than llama.cpp on this CPU for every file, up to
-  1.6× (Qwen2.5 0.5B Q4_K_M), and reads prompts faster for all of them except Llama 3.2 1B Q4_K_M.
-  Q8_0 prompts are read about 1.6× faster.
-- **Q4_K_M files of 1.5B–8B:** prompt reading is at 85–92 % of llama.cpp and short-context generation at
-  88–95 %. With a longer conversation (1,500 tokens of context) fastgguf is ahead for every model.
-- Threads (Llama 3.2 1B Q4_K_M, generation): fastgguf 10.1 / 17.4 / 27.5 tok/s with 1 / 2 / 4 threads,
-  llama.cpp 7.7 / 14.2 / 25.6.
+- **Reading the prompt:** fastgguf is faster for every model and weight type, 1.15–1.9× (Q8_0 files
+  gain the most).
+- **Long conversations** (1,500 tokens of context): fastgguf is faster or equal for every model.
+- **Generation with a short context:** fastgguf is faster for models up to 1.5B (up to 1.6× for
+  Qwen2.5 0.5B Q4_K_M), except Qwen2.5 0.5B Q4_0. For the 3B, 4B and 8B Q4_K_M files llama.cpp is
+  7–19 % faster: it re-arranges Q4_K weights at load time so that 8 rows sit side by side, which fastgguf
+  does not do yet.
+- Threads (Llama 3.2 1B Q4_K_M, generation): fastgguf 13.6 / 23.3 / 37.7 tok/s with 1 / 2 / 4 threads,
+  llama.cpp 10.7 / 19.6 / 35.1.
 - A 4-core cloud VM is slow hardware; a recent desktop with more cores and faster memory should be several
   times faster (not measured here). Run `tools/bench.py` to get numbers for your own machine.
 - For reference, people read at roughly 5 tokens per second, so anything above that feels fluent.
 
-**How it got here (v0.7.0)**
+**What changed recently** (each change measured against the version before it on the same VM, at the
+same time)
 
-| | v0.6.0 | **v0.7.0** |
-|---|---|---|
-| Llama 3.2 1B Q4_K_M, generation | 16.3 | **27.1** |
-| Gemma 3 1B Q4_K_M, generation | 15.6 | **25.5** |
-| Gemma 3 1B Q4_K_M, 512-token prompt | 94 | **211** |
-| Llama 3.2 1B Q8_0, 512-token prompt | 97 | **198** |
-| Qwen3 4B Q4_K_M, 512-token prompt | 33 | **49** |
-
-(same VM, tokens/s)
-
-- **Prefetching weights:** while one row of a weight matrix is multiplied, the next rows are already
-  requested from memory. On its own the CPU only fetched about 5 GB/s per core; with the hint it streams
-  about 12 GB/s, which made generation ~1.6× faster.
-- **Prompt reading for every common weight type:** the batched int8 matrix multiply (each weight row
-  unpacked once and multiplied with 32 tokens at a time using `dpbusd`) now covers Q4_0, Q4_1, Q5_0,
-  Q5_1 and Q8_0 as well as Q4_K and Q6_K. That is most of Gemma 3, whose 1152-wide layers cannot use
-  K-quants.
-- **Attention in tiles:** the query heads that share a key/value head (and neighbouring prompt tokens)
-  are processed together, 4 queries × 4 keys per step, with a vectorized softmax. This matters most for
-  long prompts and long conversations.
-- **The download picks the best kernels for your CPU:** each `.exe` carries AVX-512 VNNI, AVX-VNNI,
-  AVX2 and plain x86-64 builds and starts the fastest one your CPU supports (the start-up line shows
-  which). Before, release downloads were AVX2-only and never used VNNI.
+- **v0.8.0 — prompt GEMM tiles:** each step of the prompt matrix multiply now works on 4 weight rows (2 on
+  CPUs without AVX-512) instead of 2 (1), so the activations are read from cache half as often. Prompt
+  reading +28–43 % for Q4_K_M files on AVX-512, and +44 % for Llama 3.2 3B on an AVX-VNNI build.
+- **v0.8.0 — Q4_K / Q6_K generation kernels:** each block's scales are spread with one shuffle instead of
+  being moved one by one, as in llama.cpp. +3–6 % generation for Q4_K_M files.
+- **v0.8.0 — 2 MB pages (Linux):** the model file is mapped so the kernel can use 2 MB pages for it, which
+  makes streaming the weights cheaper. About +5 % generation on Linux 6.x (`FASTGGUF_THP=0` turns it off).
+- **v0.7.0 — prefetching weights:** while one row of a weight matrix is multiplied, the next rows are
+  already requested from memory: generation ~1.6× faster.
+- **v0.7.0 — prompt reading for every common weight type:** the batched int8 matrix multiply covers Q4_0,
+  Q4_1, Q5_0, Q5_1 and Q8_0 as well as Q4_K and Q6_K (most of Gemma 3, whose 1152-wide layers cannot use
+  K-quants).
+- **v0.7.0 — attention in tiles:** the query heads that share a key/value head (and neighbouring prompt
+  tokens) are processed together, 4 queries × 4 keys per step, with a vectorized softmax.
+- **v0.7.0 — one download for every CPU:** each `.exe` carries AVX-512 VNNI, AVX-VNNI, AVX2 and plain x86-64
+  builds and starts the fastest one your CPU supports (the start-up line shows which).
 
 ### What to expect on your hardware
 
@@ -441,9 +439,8 @@ real model's, because speed depends only on the sizes and weight types.
 
 ## Limitations
 
-- For Q4_K_M files of 1.5B and larger, llama.cpp is still 5–15 % faster at reading prompts and at
-  generating with a short context (see [Speed](#speed)); Gemma 4 models still read prompts token by
-  token. No ARM NEON kernels yet.
+- For Q4_K_M files of 3B and larger, llama.cpp still generates 7–19 % faster with a short context
+  (see [Speed](#speed)); Gemma 4 models still read prompts token by token. No ARM NEON kernels yet.
 - The server handles one request at a time.
 - Text only: no images/audio, no tool calling / JSON mode, no embeddings endpoint.
 - GGUF tokenizers are matched greedily (longest token first) instead of applying BPE merges,
