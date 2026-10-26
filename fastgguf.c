@@ -2419,7 +2419,7 @@ static void matvec_q4Kx8(const tensor_t *t, const q8k_blk_t *xk, float *out) {
     const int32_t *bsp = q4kx8_bsums_buf(xk, nb);
     int64_t ng = (int64_t)t->ne[1] / 8;
     const q4kx8_t *base = (const q4kx8_t *)t->rp;
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(guided, 4)
     for (int64_t g = 0; g < ng; g++)
         dot_q4Kx8(base + (size_t)g * nb, xk, bsp, nb, out + 8 * g);
 }
@@ -2444,7 +2444,7 @@ static int matvec_multi(int n, tensor_t *const *t, const float *x, float *const 
     const int32_t *bsp = q4kx8_bsums_buf(g_xq8k, nb);
     int64_t first[5] = { 0 };
     for (int i = 0; i < nf; i++) first[i + 1] = first[i] + (int64_t)f[i]->ne[1] / 8;
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(guided, 4)
     for (int64_t gg = 0; gg < first[nf]; gg++) {
         int i = 0;
         while (gg >= first[i + 1]) i++;
@@ -2481,7 +2481,7 @@ static int matvec(tensor_t *t, const float *x, float *out) {
     // special path: Q4_0 two rows at a time
     if (use_q8 == ACT_Q8 && t->type == T_Q4_0) {
         int64_t pairs = rows / 2;
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(guided, 16)
         for (int64_t pr = 0; pr < pairs; pr++) {
             int64_t r = pr * 2;
             prefetch_ahead(raw + (uint64_t)r * stride, 2 * stride);
@@ -2492,7 +2492,7 @@ static int matvec(tensor_t *t, const float *x, float *out) {
         return 0;
     }
 
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(guided, 32)
     for (int64_t r = 0; r < rows; r++) {
         prefetch_ahead(raw + (uint64_t)r * stride, stride);
         out[r] = dot_row(t->type, use_q8, raw + (uint64_t)r * stride, g_xq8, g_xq8k, x, cols, &fail);
