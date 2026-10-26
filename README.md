@@ -46,7 +46,7 @@ NVIDIA, AMD or Intel graphics card through OpenCL when one is present.
 | **Fast CPU kernels** | Integer dot products with AVX2 / AVX-VNNI / AVX-512 VNNI, all cores via OpenMP. Works without AVX2 too (portable C path). |
 | **Mixture-of-Experts** | Qwen3 MoE models. Experts are read from disk only when the router picks them, so a model larger than your RAM can still run. |
 | **TurboQuant KV cache** | Optional compressed attention cache (`FASTGGUF_KV=turbo`): 5–9× less memory for long conversations, with a Hadamard rotation that keeps accuracy. |
-| **Batched prompt reading** | The message is processed in batches of up to 64 tokens with an int8 matrix-multiply (VNNI where available), 6–8× faster than token by token; results agree with token-by-token up to float rounding. |
+| **Batched prompt reading** | The message is processed in batches of up to 64 tokens with an int8 matrix-multiply (VNNI where available) and tiled attention, 7–9× faster than token by token; results agree with token-by-token up to float rounding. |
 | **Prompt cache reuse** | The server keeps the previous conversation in the KV cache and only processes the new part of each request. |
 | **Sampling controls** | temperature, top-k, top-p, repeat penalty, seed (reproducible replies), greedy mode. |
 | **Unicode everywhere** | Arabic, CJK and emoji are printed correctly, including on the Windows console and in file paths. |
@@ -60,8 +60,8 @@ NVIDIA, AMD or Intel graphics card through OpenCL when one is present.
 ### 1. Get the program
 
 **Windows** — download **`fastgguf-…-windows-x64.zip`** from the
-[**Releases page**](../../releases/latest), unzip it, done (no installation; use the `-compat` zip only
-on very old CPUs without AVX2). Or build it yourself:
+[**Releases page**](../../releases/latest), unzip it, done (no installation; it works on any 64-bit
+Intel / AMD CPU and picks the fastest kernels yours supports). Or build it yourself:
 
 ```bat
 build.bat
@@ -184,9 +184,12 @@ Windows 10/11, Linux, macOS. The prebuilt Windows download is a single static `.
 
 | CPU | Path used | Speed |
 |---|---|---|
+| Intel 12th gen+ (Alder Lake: AVX-VNNI), Intel Ice Lake / Sapphire Rapids, AMD Zen 4/5 (AVX-512 VNNI) | integer kernels with the VNNI dot-product instruction | ★★★+ |
 | Intel 4th gen Core (Haswell, 2013) and newer, AMD Ryzen / EPYC (Zen, 2017) and newer — **any x86-64 with AVX2** | AVX2 integer kernels | ★★★ |
-| Intel 12th gen+ (Alder Lake: AVX-VNNI), Intel Ice Lake / Sapphire Rapids, AMD Zen 4/5 (AVX-512 VNNI) | AVX2 kernels + VNNI dot-product instruction | ★★★+ |
 | Older x86-64 without AVX2 (Sandy/Ivy Bridge, AMD FX, Atom/Celeron) | portable C | ★ |
+
+The release downloads contain all three and choose at start-up (`FASTGGUF_CPU=avx512|avxvnni|avx2|sse2`
+forces one). A build made with `make` on your own machine uses `-march=native` instead.
 | ARM: Apple Silicon (M1–M4), Snapdragon, Raspberry Pi 4/5 | portable C (no NEON kernels yet) | ★ |
 
 All cores are used through OpenMP (set `OMP_NUM_THREADS` to change it). Generation speed is
@@ -217,77 +220,77 @@ self-check against the CPU; if anything fails, fastgguf silently stays on the CP
 
 ### Measured: fastgguf vs llama.cpp on the same CPU
 
-Measured in a cloud VM: **Intel Xeon @ 2.8 GHz, 4 vCPUs (AVX-512), 15 GB RAM, no GPU.** Both engines read the *same* GGUF files, generate 128 tokens with 4 threads, and the mean of 3 runs is reported (fastgguf: `fastgguf chat … --temp 0 --max-tokens 128`; llama.cpp: `llama-bench -p 0 -n 128`). The files were made with `tools/synth_gguf.py`: exact layer sizes and weight types of the real models, filled with random values, so anyone can reproduce the numbers without downloading anything. Raw data: [`docs/benchmark.json`](docs/benchmark.json).
+Measured in a cloud VM: **Intel Xeon @ 2.1 GHz (Sapphire Rapids), 4 vCPUs, no GPU**, 4 threads for both
+engines, which read the *same* GGUF files. llama.cpp numbers come from `llama-bench`; fastgguf runs the
+same work (512-token prompt; 48 generated tokens after a 16-token or a 1,500-token context). The files
+were made with `tools/synth_gguf.py`: exact layer sizes and weight types of the real models, filled with
+random values, so anyone can reproduce the numbers without downloading anything. Raw data:
+[`docs/benchmark.json`](docs/benchmark.json).
 
 ![Generation speed, fastgguf vs llama.cpp](docs/images/benchmark.svg)
 
-| Model | Weights | File | fastgguf tok/s | llama.cpp tok/s | fastgguf / llama.cpp |
+![Prompt reading speed, fastgguf vs llama.cpp](docs/images/benchmark-prompt.svg)
+
+| Model | Weights | File | Prompt (512 tokens) fastgguf / llama.cpp | Generation fastgguf / llama.cpp | Generation at 1,500 context |
 |---|---|---|---|---|---|
-| Qwen2.5 0.5B | Q4_0 | 0.28 GB | **43.0** | 69.2 | 62 % |
-| Qwen2.5 0.5B | Q8_0 | 0.53 GB | **33.5** | 39.7 | 84 % |
-| Qwen2.5 0.5B | Q4_K_M | 0.40 GB | **36.6** | 43.5 | 84 % |
-| Llama 3.2 1B | Q4_0 | 0.70 GB | **18.5** | 28.6 | 65 % |
-| Llama 3.2 1B | Q8_0 | 1.32 GB | **15.3** | 18.0 | 85 % |
-| Llama 3.2 1B | Q4_K_M | 0.80 GB | **19.9** | 27.6 | 72 % |
-| Gemma 3 1B | Q4_K_M | 0.81 GB | **18.1** | 24.6 | 73 % |
-| Qwen2.5 1.5B | Q4_K_M | 0.98 GB | **16.0** | 20.8 | 77 % |
-| Llama 3.2 3B | Q4_K_M | 2.01 GB | **7.6** | 10.9 | 70 % |
-| Qwen3 4B | Q4_K_M | 2.50 GB | **4.9** | 8.2 | 60 % |
-| Llama 3.1 8B | Q4_K_M | 4.92 GB | **3.5** | 4.9 | 72 % |
+| Qwen2.5 0.5B | Q4_0 | 0.28 GB | **533** / 456 | **68.6** / 52.0 | **65.4** / 42.4 |
+| Qwen2.5 0.5B | Q8_0 | 0.53 GB | **509** / 304 | **44.2** / 37.2 | **43.4** / 29.5 |
+| Qwen2.5 0.5B | Q4_K_M | 0.40 GB | **495** / 317 | **54.8** / 35.1 | **53.9** / 33.5 |
+| Llama 3.2 1B | Q4_0 | 0.70 GB | **209** / 182 | **27.0** / 25.0 | **25.2** / 19.1 |
+| Llama 3.2 1B | Q8_0 | 1.32 GB | **198** / 125 | **21.1** / 15.7 | **20.4** / 13.5 |
+| Llama 3.2 1B | Q4_K_M | 0.80 GB | 187 / **207** | **27.1** / 25.3 | **24.0** / 19.2 |
+| Gemma 3 1B | Q4_K_M | 0.81 GB | **211** / 169 | **25.5** / 19.5 | **24.6** / 18.7 |
+| Qwen2.5 1.5B | Q4_K_M | 0.98 GB | 127 / **140** | 20.8 / **21.8** | **20.7** / 18.2 |
+| Llama 3.2 3B | Q4_K_M | 2.01 GB | 65 / **75** | 10.7 / **11.3** | **9.1** / 7.6 |
+| Qwen3 4B | Q4_K_M | 2.50 GB | 49 / **53** | 8.0 / **9.1** | **6.9** / 6.0 |
+| Llama 3.1 8B | Q4_K_M | 4.92 GB | 27 / **30** | 4.6 / **5.2** | **4.2** / 4.1 |
+
+All numbers are tokens per second; the faster engine is in bold.
 
 **What the numbers say**
 
-- fastgguf generates text at **roughly 60–85 % of llama.cpp's speed** on this CPU (Q4_K_M and Q8_0 files
-  60–85 %, Q4_0 62–65 %, where llama.cpp re-arranges the weights into a faster layout at load time).
-- **Long conversations:** attention (looking back over the whole conversation) now runs on all cores
-  with vectorized dot products, so generation slows down much less as the context grows. With 1,500
-  tokens already in the context (tokens/s):
-
-| Model | v0.4.0 | **now** | llama.cpp |
-|---|---|---|---|
-| Llama 3.2 3B Q4_K_M | 3.1 | **7.7** | 7.5 |
-| Gemma 3 1B Q4_K_M | 12.1 | **17.8** | 18.2 |
-| Llama 3.2 1B Q4_K_M | 8.8 | **18.0** | 21.3 |
-| Qwen2.5 0.5B Q4_0 | 14.8 | **27.4** | 40.0 |
-
-- Thread scaling at short context (Llama 3.2 1B Q4_K_M):
-
-| Threads | fastgguf tok/s | llama.cpp tok/s |
-|---|---|---|
-| 1 | 7.1 | 8.2 |
-| 2 | 12.1 | 14.3 |
-| 4 | 17.2 | 24.8 |
-
-- Recent speed-ups: the K-quant kernels (Q4_K / Q5_K / Q6_K) now sum each 256-value block in integers
-  with one scale for the activations, like llama.cpp — about 1.2–1.7× faster generation for Q4_K_M files
-  (Llama 3.2 1B: 11.8 → 20 tok/s). Integer kernels for Q5_0 / Q5_1 / Q4_1 made Gemma 3 1B and
-  Qwen2.5 0.5B Q4_K_M files 4.5–5× faster (they store many weights as Q5_0).
-- **Reading the prompt** (the message you send, before the reply starts) runs in batches of up to 64
-  tokens. For Q4_K / Q6_K weights each row is unpacked once into plain bytes and multiplied with 32
-  tokens at a time using `dpbusd` (one instruction = 32 int8 multiply-adds; AVX-VNNI / AVX-512 VNNI,
-  with an AVX2 fallback), the same approach as llama.cpp's tiled CPU path. 512-token prompt, tokens/s:
-
-| Model (Q4_K_M) | token by token | v0.5.0 (batched) | **now** | llama.cpp |
-|---|---|---|---|---|
-| Llama 3.2 1B | 16.5 | 64.9 | **133.7** | 173.7 |
-| Qwen2.5 1.5B | 13.4 | 43.7 | **100.7** | 127.3 |
-| Gemma 3 1B | 16.2 | 73.4 | **92.5** | 136.6 |
-| Llama 3.2 3B | 6.2 | 21.7 | **48.5** | 61.5 |
-| Llama 3.1 8B | 3.1 | 8.4 | **18.3** | 25.2 |
-
-  Gemma 3 1B gains less because its Q4_K_M file also stores many weights as Q5_0 / Q8_0
-  (layer width 1152), which still use the older 4-token kernel.
-
+- **Models below 1.5B:** fastgguf generates faster than llama.cpp on this CPU for every file, up to
+  1.6× (Qwen2.5 0.5B Q4_K_M), and reads prompts faster for all of them except Llama 3.2 1B Q4_K_M.
+  Q8_0 prompts are read about 1.6× faster.
+- **Q4_K_M files of 1.5B–8B:** prompt reading is at 85–92 % of llama.cpp and short-context generation at
+  88–95 %. With a longer conversation (1,500 tokens of context) fastgguf is ahead for every model.
+- Threads (Llama 3.2 1B Q4_K_M, generation): fastgguf 10.1 / 17.4 / 27.5 tok/s with 1 / 2 / 4 threads,
+  llama.cpp 7.7 / 14.2 / 25.6.
 - A 4-core cloud VM is slow hardware; a recent desktop with more cores and faster memory should be several
   times faster (not measured here). Run `tools/bench.py` to get numbers for your own machine.
 - For reference, people read at roughly 5 tokens per second, so anything above that feels fluent.
+
+**How it got here (v0.7.0)**
+
+| | v0.6.0 | **v0.7.0** |
+|---|---|---|
+| Llama 3.2 1B Q4_K_M, generation | 16.3 | **27.1** |
+| Gemma 3 1B Q4_K_M, generation | 15.6 | **25.5** |
+| Gemma 3 1B Q4_K_M, 512-token prompt | 94 | **211** |
+| Llama 3.2 1B Q8_0, 512-token prompt | 97 | **198** |
+| Qwen3 4B Q4_K_M, 512-token prompt | 33 | **49** |
+
+(same VM, tokens/s)
+
+- **Prefetching weights:** while one row of a weight matrix is multiplied, the next rows are already
+  requested from memory. On its own the CPU only fetched about 5 GB/s per core; with the hint it streams
+  about 12 GB/s, which made generation ~1.6× faster.
+- **Prompt reading for every common weight type:** the batched int8 matrix multiply (each weight row
+  unpacked once and multiplied with 32 tokens at a time using `dpbusd`) now covers Q4_0, Q4_1, Q5_0,
+  Q5_1 and Q8_0 as well as Q4_K and Q6_K. That is most of Gemma 3, whose 1152-wide layers cannot use
+  K-quants.
+- **Attention in tiles:** the query heads that share a key/value head (and neighbouring prompt tokens)
+  are processed together, 4 queries × 4 keys per step, with a vectorized softmax. This matters most for
+  long prompts and long conversations.
+- **The download picks the best kernels for your CPU:** each `.exe` carries AVX-512 VNNI, AVX-VNNI,
+  AVX2 and plain x86-64 builds and starts the fastest one your CPU supports (the start-up line shows
+  which). Before, release downloads were AVX2-only and never used VNNI.
 
 ### What to expect on your hardware
 
 For each new token, the whole model is read from memory once, so **the upper limit is
 roughly memory bandwidth ÷ model file size**. The table shows that ceiling for a few
-common setups — real speed is always lower, and fastgguf is currently slower than llama.cpp
-(see above). **These numbers are calculated, not measured.**
+common setups — real speed is always lower. **These numbers are calculated, not measured.**
 
 | Hardware | Memory bandwidth | Ceiling, 3B Q4_K_M (2.0 GB) | Ceiling, 8B Q4_K_M (4.9 GB) |
 |---|---|---|---|
@@ -326,7 +329,8 @@ almost all models; otherwise the normal cache is used).
 
 1. Use a discrete GPU if you have one (it is used automatically).
 2. **Q4_K_M** is a good default; **Q4_0** is a bit faster for small models (lower quality).
-3. Build with `make` on the machine that runs it (`-march=native` enables VNNI/AVX-512).
+3. The release download already picks the best kernels for your CPU; `make` on your own machine
+   (`-march=native`) can be a little faster still.
 4. On laptops, plug in the charger (fastgguf already opts out of Windows 11 power throttling).
 5. Close memory-heavy programs; the model must fit in RAM to avoid disk reads.
 
@@ -409,7 +413,7 @@ Windows example: `set FASTGGUF_KV=turbo` then `fastgguf.exe chat model.gguf 1638
 | Windows `.exe` from Linux (cross-compile) | `make portable OS=Windows_NT CC=x86_64-w64-mingw32-gcc` |
 | macOS (Apple clang, single-threaded) | `make fastgguf CC=clang CFLAGS="-O3" LDLIBS="-lm"` |
 | macOS with OpenMP (`brew install gcc`) | `make CC=gcc-14 ARCH=` |
-| Portable binary for other PCs (AVX2) | `make portable` or `build.bat portable` |
+| Portable binary for other PCs (picks AVX-512 VNNI / AVX-VNNI / AVX2 / x86-64 at start-up) | `make portable` or `build.bat portable` |
 
 By hand: `gcc -O3 -march=native -fopenmp -o fastgguf fastgguf.c -lm -ldl`
 (Windows: replace `-ldl` with `-lws2_32 -static`). The Makefile builds single-threaded with a warning if the
@@ -435,10 +439,9 @@ real model's, because speed depends only on the sizes and weight types.
 
 ## Limitations
 
-- Prompt reading reaches about 70–80 % of llama.cpp's speed for Q4_K_M files (less for files with
-  many Q5_0 / Q8_0 weights); Gemma 4 models still read prompts token by token.
-- Generation with a short context is 15–40 % slower than llama.cpp on CPU (see [Speed](#speed));
-  with long contexts the two are close. No ARM NEON kernels yet.
+- For Q4_K_M files of 1.5B and larger, llama.cpp is still 5–15 % faster at reading prompts and at
+  generating with a short context (see [Speed](#speed)); Gemma 4 models still read prompts token by
+  token. No ARM NEON kernels yet.
 - The server handles one request at a time.
 - Text only: no images/audio, no tool calling / JSON mode, no embeddings endpoint.
 - GGUF tokenizers are matched greedily (longest token first) instead of applying BPE merges,
@@ -449,6 +452,7 @@ real model's, because speed depends only on the sizes and weight types.
 ```
 fastgguf.c              the whole engine, CLI and server
 Makefile, build.bat     build scripts
+dispatch.c              start-up CPU check for the portable builds
 chat.bat, server.bat    Windows drag-and-drop launchers
 run.sh                  Linux/macOS launcher
 tools/synth_gguf.py     synthetic GGUF models for benchmarks and tests
