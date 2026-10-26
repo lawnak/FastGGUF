@@ -56,9 +56,14 @@ jobs:
           name: release-windows
           path: dist/*.zip
 
+  # built in an older distribution so the binary needs only an older glibc (2.35): it then runs on
+  # Ubuntu 22.04+, Debian 12+, Fedora 36+ and other current distributions
   build-linux:
     runs-on: ubuntu-latest
+    container: ubuntu:22.04
     steps:
+      - name: Install the compiler
+        run: apt-get update -q && apt-get install -y -q gcc make
       - uses: actions/checkout@v4
       - name: Build (AVX-512 VNNI / AVX-VNNI / AVX2 / x86-64 in each binary) and self-test
         run: |
@@ -68,6 +73,7 @@ jobs:
             FASTGGUF_CPU=$v ./fastgguf selftest > st.log 2>&1 || { cat st.log; exit 1; }
             if grep -q "cannot run" st.log; then echo "$v: not supported by this runner"; else echo "$v: $(tail -1 st.log)"; fi
           done
+          echo "highest glibc symbol needed:"; objdump -T fastgguf | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
       - name: Package
         run: |
           mkdir -p dist/linux
