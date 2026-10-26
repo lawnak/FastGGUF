@@ -2225,7 +2225,7 @@ static void gemm_alloc(int max_cols) {
     }
     size_t tok = FG_BATCH + GV;   // room for padding to a whole vector
     g_gpk = (int8_t *)malloc(tok * (size_t)max_cols + 64);
-    g_gyd = (float *)malloc(tok * ((size_t)max_cols / 256 + 1) * sizeof(float));
+    g_gyd = (float *)malloc(tok * ((size_t)max_cols / 32 + 1) * sizeof(float));
     g_gbs = (float *)malloc(tok * ((size_t)max_cols / 16 + 1) * sizeof(float));
 }
 
@@ -2477,6 +2477,157 @@ static void gemm_kquant(tensor_t *t, int cols, int64_t rows, const q8k_blk_t *xk
         }
     }
 }
+
+// -------------------------------------------------------------------------
+// The same GEMM for the 32-value block types (Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0) with Q8
+// activations. A row unpacks to unsigned bytes q plus, per 32 values, a scale and an offset
+// (value = wsc·q − wmn); the activations also have one scale per 32, so per group and token
+//     Σ w·x = xd · (wsc · Σ q·xq) − wmn · (xd · Σ xq)
+// Q8_0 is stored as q + 128, which needs the full u8 range of dpbusd: VNNI CPUs only (the
+// maddubs fallback would saturate).
+// -------------------------------------------------------------------------
+#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
+#define GEMM_Q8_0 1
+#else
+#define GEMM_Q8_0 0
+#endif
+
+static int gemm_q32_type(uint32_t type) {
+    return type == T_Q4_0 || type == T_Q4_1 || type == T_Q5_0 || type == T_Q5_1 ||
+           (GEMM_Q8_0 && type == T_Q8_0);
+}
+
+static void unpack_row_q32(uint32_t type, const uint8_t *row, int nb, uint8_t *q, float *wsc, float *wmn) {
+    const __m256i x10 = _mm256_set1_epi8(0x10), x80 = _mm256_set1_epi8((char)0x80);
+    for (int b = 0; b < nb; b++) {
+        __m256i v;
+        float d, m;
+        switch (type) {
+        case T_Q4_0: { const uint8_t *p = row + b * 18; d = FP16(rd_u16(p)); m = 8.0f * d;
+                       v = nibbles32(p + 2); break; }
+        case T_Q4_1: { const uint8_t *p = row + b * 20; d = FP16(rd_u16(p)); m = -FP16(rd_u16(p + 2));
+                       v = nibbles32(p + 4); break; }
+        case T_Q5_0: { const uint8_t *p = row + b * 22; d = FP16(rd_u16(p)); m = 16.0f * d;
+                       v = _mm256_or_si256(nibbles32(p + 6), _mm256_and_si256(bytes_from_bits_32(p + 2), x10)); break; }
+        case T_Q5_1: { const uint8_t *p = row + b * 24; d = FP16(rd_u16(p)); m = -FP16(rd_u16(p + 2));
+                       v = _mm256_or_si256(nibbles32(p + 8), _mm256_and_si256(bytes_from_bits_32(p + 4), x10)); break; }
+        default:     { const uint8_t *p = row + b * 34; d = FP16(rd_u16(p)); m = 128.0f * d;   // Q8_0
+                       v = _mm256_xor_si256(_mm256_loadu_si256((const __m256i *)(p + 2)), x80); break; }
+        }
+        _mm256_storeu_si256((__m256i *)(q + 32 * b), v);
+        wsc[b] = d; wmn[b] = m;
+    }
+}
+
+// pack Q8 activations: values as for the K-quants, plus per (vector, group, token) the scale xd
+// (g_gyd) and xd·Σxq (g_gbs)
+static void gemm_pack_q8(const q8_blk_t *xq, size_t s8, int nb, int cols) {
+    int ng = cols / 32, nk4 = cols / 4, nvec = (nb + GV - 1) / GV;
+    #pragma omp parallel for schedule(static)
+    for (int c = 0; c < nvec; c++) {
+        int32_t *dst = (int32_t *)(g_gpk + (size_t)c * nk4 * GV * 4);
+        for (int t = 0; t < GV; t++) {
+            int tok = c * GV + t;
+            const q8_blk_t *y = tok < nb ? xq + (size_t)tok * s8 : NULL;
+            for (int g = 0; g < ng; g++) {
+                int32_t w[8] = {0};
+                if (y) memcpy(w, y[g].qs, 32);
+                for (int i = 0; i < 8; i++) dst[((size_t)g * 8 + i) * GV + t] = w[i];
+                g_gyd[((size_t)c * ng + g) * GV + t] = y ? y[g].d : 0.0f;
+                g_gbs[((size_t)c * ng + g) * GV + t] = y ? y[g].d * (float)(y[g].s16[0] + y[g].s16[1]) : 0.0f;
+            }
+        }
+    }
+}
+
+// NR weight rows × NV vectors of tokens (from vector c0); NR and NV are constants after inlining,
+// so the accumulators stay in registers
+static inline __attribute__((always_inline))
+void gemm32_kern(const int NR, const int NV, const uint8_t *q, const float *wsc, const float *wmn,
+                 size_t qoff, size_t soff, int cols, int c0, float *Y, int ldy, int64_t r, int nb) {
+    int ng = cols / 32, nk4 = cols / 4;
+    __m256 acc[2][4];
+    const int8_t *P[4];
+    for (int v = 0; v < NV; v++) P[v] = g_gpk + (size_t)(c0 + v) * nk4 * GV * 4;
+    for (int k = 0; k < NR; k++) for (int v = 0; v < NV; v++) acc[k][v] = _mm256_setzero_ps();
+    for (int g = 0; g < ng; g++) {
+        __m256i ia[2][4];
+        for (int k = 0; k < NR; k++) for (int v = 0; v < NV; v++) ia[k][v] = _mm256_setzero_si256();
+        size_t o = (size_t)g * 32 * GV;
+        for (int s = 0; s < 8; s++, o += 4 * GV) {
+            __m256i x[4], w[2];
+            for (int v = 0; v < NV; v++) x[v] = _mm256_loadu_si256((const __m256i *)(P[v] + o));
+            for (int k = 0; k < NR; k++) {
+                int32_t w4; memcpy(&w4, q + k * qoff + 32 * g + 4 * s, 4);
+                w[k] = _mm256_set1_epi32(w4);
+            }
+            for (int k = 0; k < NR; k++) for (int v = 0; v < NV; v++) ia[k][v] = dp_u8s8(ia[k][v], w[k], x[v]);
+        }
+        for (int v = 0; v < NV; v++) {
+            size_t gi = ((size_t)(c0 + v) * ng + g) * GV;
+            __m256 yd = _mm256_loadu_ps(g_gyd + gi), ys = _mm256_loadu_ps(g_gbs + gi);
+            for (int k = 0; k < NR; k++) {
+                __m256 ws = _mm256_mul_ps(_mm256_set1_ps(wsc[k * soff + g]), yd);
+                acc[k][v] = _mm256_fmadd_ps(ws, _mm256_cvtepi32_ps(ia[k][v]), acc[k][v]);
+                acc[k][v] = _mm256_fnmadd_ps(_mm256_set1_ps(wmn[k * soff + g]), ys, acc[k][v]);
+            }
+        }
+    }
+    for (int k = 0; k < NR; k++)
+        for (int v = 0; v < NV; v++) {
+            float o[GV];
+            _mm256_storeu_ps(o, acc[k][v]);
+            for (int i = 0; i < GV; i++) {
+                int tok = (c0 + v) * GV + i;
+                if (tok < nb) Y[(size_t)tok * ldy + r + k] = o[i];
+            }
+        }
+}
+
+static void gemm32_r1v1(const uint8_t *q, const float *sc, const float *mn, size_t qo, size_t so, int cols, int c0, float *Y, int ldy, int64_t r, int nb) { gemm32_kern(1, 1, q, sc, mn, qo, so, cols, c0, Y, ldy, r, nb); }
+static void gemm32_r1v4(const uint8_t *q, const float *sc, const float *mn, size_t qo, size_t so, int cols, int c0, float *Y, int ldy, int64_t r, int nb) { gemm32_kern(1, 4, q, sc, mn, qo, so, cols, c0, Y, ldy, r, nb); }
+#if defined(__AVX512VL__)
+static void gemm32_r2v4(const uint8_t *q, const float *sc, const float *mn, size_t qo, size_t so, int cols, int c0, float *Y, int ldy, int64_t r, int nb) { gemm32_kern(2, 4, q, sc, mn, qo, so, cols, c0, Y, ldy, r, nb); }
+#endif
+
+// Y = W · X for a 32-block weight and nb ≥ GV tokens already quantized to Q8 (xq, stride s8)
+static void gemm_q32(tensor_t *t, int cols, int64_t rows, const q8_blk_t *xq, size_t s8,
+                     float *Y, int ldy, int nb) {
+    uint64_t stride = row_stride(t->type, (uint64_t)cols);
+    gemm_alloc(g_max_cols);
+    gemm_pack_q8(xq, s8, nb, cols);
+    int nvec = (nb + GV - 1) / GV, nbl = cols / 32;
+#if defined(__AVX512VL__)
+    const int RP = 2;
+#else
+    const int RP = 1;
+#endif
+    size_t qoff = (size_t)g_gemm_cols + 64, soff = (size_t)g_gemm_cols / 16 + 1;
+    int64_t nsteps = (rows + RP - 1) / RP;
+    #pragma omp parallel for schedule(static)
+    for (int64_t st = 0; st < nsteps; st++) {
+        int th = omp_get_thread_num();
+        int64_t r = st * RP;
+        int two = RP == 2 && r + 1 < rows;
+        for (int k = 0; k <= two; k++)
+            unpack_row_q32(t->type, t->data + (uint64_t)(r + k) * stride, nbl,
+                           g_gq[th] + k * qoff, g_gsc[th] + k * soff, g_gmn[th] + k * soff);
+        const uint8_t *q = g_gq[th];
+        const float *sc = g_gsc[th], *mn = g_gmn[th];
+        int c = 0;
+#if defined(__AVX512VL__)
+        if (two)
+            for (; c + GT <= nvec; c += GT) gemm32_r2v4(q, sc, mn, qoff, soff, cols, c, Y, ldy, r, nb);
+#endif
+        for (int k = 0; k <= two; k++) {
+            int cc = c;
+            for (; cc + GT <= nvec; cc += GT)
+                gemm32_r1v4(q + k * qoff, sc + k * soff, mn + k * soff, 0, 0, cols, cc, Y, ldy, r + k, nb);
+            for (; cc < nvec; cc++)
+                gemm32_r1v1(q + k * qoff, sc + k * soff, mn + k * soff, 0, 0, cols, cc, Y, ldy, r + k, nb);
+        }
+    }
+}
 #endif
 
 // Y[b·ldy + r] = dot(W[r], X[b·ldx ...]) for b < nb (nb ≤ FG_BATCH) — each weight row is loaded once
@@ -2502,6 +2653,10 @@ static int matmul(tensor_t *t, const float *X, int ldx, float *Y, int ldy, int n
     // Q4_K / Q6_K with a real batch: unpack each row once, int8 GEMM with dpbusd
     if (kind == ACT_Q8K && (t->type == T_Q4_K || t->type == T_Q6_K) && nb >= GV) {
         gemm_kquant(t, cols, rows, g_bxq8k, sk, Y, ldy, nb);
+        return 0;
+    }
+    if (kind == ACT_Q8 && gemm_q32_type(t->type) && nb >= GV) {
+        gemm_q32(t, cols, rows, g_bxq8, s8, Y, ldy, nb);
         return 0;
     }
 #endif
@@ -4928,45 +5083,52 @@ static int cmd_selftest(void) {
     fails += test_kquant("Q5_K", T_Q5_K, 176, dot_q5_K_q8k);
     fails += test_kquant("Q6_K", T_Q6_K, 210, dot_q6_K_q8k);
 
-    // --- prompt-batch GEMM (Q4_K / Q6_K): matmul() against the single-input kernel on the same
-    //     Q8_K inputs; odd row count and a batch that is not a multiple of 32 exercise every path
+    // --- prompt-batch GEMM: matmul() against the single-input kernel on the same quantized
+    //     inputs; odd row count and a batch that is not a multiple of 32 exercise every path
     {
         int cols = 512, rows = 37, nbt = 45;
         matvec_init_scratch(cols);
-        static const struct { uint32_t type; const char *name; int bytes; } gt[2] = {
-            { T_Q4_K, "Q4_K", 144 }, { T_Q6_K, "Q6_K", 210 } };
+        static const struct { uint32_t type; const char *name; int bytes, blk; } gt[7] = {
+            { T_Q4_K, "Q4_K", 144, 256 }, { T_Q6_K, "Q6_K", 210, 256 }, { T_Q4_0, "Q4_0", 18, 32 },
+            { T_Q4_1, "Q4_1", 20, 32 }, { T_Q5_0, "Q5_0", 22, 32 }, { T_Q5_1, "Q5_1", 24, 32 },
+            { T_Q8_0, "Q8_0", 34, 32 } };
         float *X = (float *)malloc((size_t)nbt * cols * sizeof(float));
         float *Y = (float *)malloc((size_t)nbt * rows * sizeof(float));
         for (int i = 0; i < nbt * cols; i++) X[i] = (float)(rand() % 2000 - 1000) / 500.0f;
-        for (int k = 0; k < 2; k++) {
-            size_t rbytes = (size_t)(cols / 256) * gt[k].bytes;
+        for (int k = 0; k < 7; k++) {
+            int nblk = cols / gt[k].blk;
+            size_t rbytes = (size_t)nblk * gt[k].bytes;
             uint8_t *w = (uint8_t *)malloc(rbytes * rows);
             for (size_t i = 0; i < rbytes * rows; i++) w[i] = (uint8_t)(rand() & 0xFF);
-            for (int b = 0; b < rows * (cols / 256); b++) {
+            for (int b = 0; b < rows * nblk; b++) {   // finite fp16 scales (d, and dmin / m where present)
                 uint8_t *p = w + (size_t)b * gt[k].bytes;
                 uint16_t h = (uint16_t)(0x2C00 + (rand() & 0x3FF)), h2 = (uint16_t)(0x2400 + (rand() & 0x3FF));
                 if (gt[k].type == T_Q6_K) memcpy(p + 208, &h, 2);
-                else { memcpy(p, &h, 2); memcpy(p + 2, &h2, 2); }
+                else {
+                    memcpy(p, &h, 2);
+                    if (gt[k].type == T_Q4_K || gt[k].type == T_Q4_1 || gt[k].type == T_Q5_1) memcpy(p + 2, &h2, 2);
+                }
             }
             tensor_t t;
             memset(&t, 0, sizeof(t));
             snprintf(t.name, sizeof(t.name), "selftest.%s", gt[k].name);
             t.type = gt[k].type; t.n_dims = 2; t.ne[0] = cols; t.ne[1] = rows; t.data = w; t.nbytes = rbytes * rows;
             matmul(&t, X, cols, Y, rows, nbt);
-            size_t sk = (size_t)g_max_cols / 256 + 1;
+            int kind = type_uses_q8(t.type, cols), fail = 0;
+            size_t s8 = (size_t)g_max_cols / 32 + 1, sk = (size_t)g_max_cols / 256 + 1;
             double emax = 0, ymax = 0;
             for (int b = 0; b < nbt; b++)
                 for (int r = 0; r < rows; r++) {
-                    const uint8_t *rb = w + (size_t)r * rbytes;
-                    float ref = gt[k].type == T_Q4_K ? dot_q4_K_q8k(rb, g_bxq8k + b * sk, cols / 256)
-                                                     : dot_q6_K_q8k(rb, g_bxq8k + b * sk, cols / 256);
+                    float ref = dot_row(t.type, kind, w + (size_t)r * rbytes, g_bxq8 + b * s8, g_bxq8k + b * sk,
+                                        X + (size_t)b * cols, cols, &fail);
                     double e = fabs(ref - Y[(size_t)b * rows + r]);
                     if (e > emax) emax = e;
                     if (fabs(ref) > ymax) ymax = fabs(ref);
                 }
             double rel = emax / (ymax + 1e-9);
-            printf("%-5s batch GEMM vs single kernel: rel_err=%.2e %s\n", gt[k].name, rel, rel < 1e-5 ? "OK" : "FAIL");
-            if (rel >= 1e-5) fails++;
+            int ok = rel < 1e-5 && !fail;
+            printf("%-5s batch GEMM vs single kernel: rel_err=%.2e %s\n", gt[k].name, rel, ok ? "OK" : "FAIL");
+            if (!ok) fails++;
             free(w);
         }
         free(X); free(Y);

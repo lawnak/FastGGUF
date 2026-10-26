@@ -31,7 +31,7 @@ jobs:
       - name: Batched prompt gives the same reply as token-by-token
         run: |
           P=$(python3 -c "print('The quick brown fox jumps over the lazy dog. ' * 8)")
-          for q in q8_0 q4_k_m; do
+          for q in q8_0 q4_k_m q4_0; do
             python tools/synth_gguf.py tiny-test $q t.gguf
             a=$(printf '%s\n' "$P" | ./fastgguf chat t.gguf 1024 --temp 0 --max-tokens 24 | grep -a '^llama>')
             b=$(printf '%s\n' "$P" | FASTGGUF_BATCH=0 ./fastgguf chat t.gguf 1024 --temp 0 --max-tokens 24 | grep -a '^llama>')
