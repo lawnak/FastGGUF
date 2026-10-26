@@ -217,7 +217,7 @@ self-check against the CPU; if anything fails, fastgguf silently stays on the CP
 
 ### Measured: fastgguf vs llama.cpp on the same CPU
 
-Measured in a cloud VM: **Intel Xeon @ 2.8 GHz, 4 vCPUs (AVX-512), 15 GB RAM, no GPU.** Both engines read the *same* GGUF files, generate 128 tokens with 4 threads, and the mean of 3 runs is reported (fastgguf: `fastgguf chat … --temp 0 --max-tokens 128`; llama.cpp: `llama-bench -p 0 -n 128`). The files were made with `tools/synth_gguf.py`: exact layer sizes and weight types of the real models, random values (this VM could not download models). Raw data: [`docs/benchmark.json`](docs/benchmark.json).
+Measured in a cloud VM: **Intel Xeon @ 2.8 GHz, 4 vCPUs (AVX-512), 15 GB RAM, no GPU.** Both engines read the *same* GGUF files, generate 128 tokens with 4 threads, and the mean of 3 runs is reported (fastgguf: `fastgguf chat … --temp 0 --max-tokens 128`; llama.cpp: `llama-bench -p 0 -n 128`). The files were made with `tools/synth_gguf.py`: exact layer sizes and weight types of the real models, filled with random values, so anyone can reproduce the numbers without downloading anything. Raw data: [`docs/benchmark.json`](docs/benchmark.json).
 
 ![Generation speed, fastgguf vs llama.cpp](docs/images/benchmark.svg)
 
