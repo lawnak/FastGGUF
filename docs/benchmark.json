@@ -4,135 +4,136 @@
     "generation": "48 tokens after a 16-token context, 4 threads (llama.cpp: llama-bench -p 0 -n 48 -d 16)",
     "long": "48 tokens after 1500 tokens of context (llama-bench -p 0 -n 48 -d 1500)",
     "prompt": "512-token prompt (llama-bench -p 512 -n 0)",
-    "runs": "fastgguf best of 3, llama.cpp mean of 3; both engines measured back to back for each model"
+    "runs": "fastgguf best of 3, llama.cpp mean of 3; both engines measured back to back for each model",
+    "threads": "best of 2 interleaved runs, measured separately"
   },
   "rows": [
     {
       "model": "qwen2.5-0.5b-q4_0",
       "gb": 0.281,
-      "fastgguf": 106.87,
-      "llamacpp": 117.6,
-      "prompt_fastgguf": 766.0,
-      "prompt_llamacpp": 595.2,
-      "long_fastgguf": 89.15,
-      "long_llamacpp": 77.5
+      "fastgguf": 103.89,
+      "llamacpp": 79.0,
+      "prompt_fastgguf": 722.5,
+      "prompt_llamacpp": 585.9,
+      "long_fastgguf": 90.5,
+      "long_llamacpp": 63.2
     },
     {
       "model": "qwen2.5-0.5b-q8_0",
       "gb": 0.528,
-      "fastgguf": 69.76,
-      "llamacpp": 54.2,
-      "prompt_fastgguf": 728.4,
-      "prompt_llamacpp": 398.7,
-      "long_fastgguf": 70.75,
-      "long_llamacpp": 43.1
+      "fastgguf": 67.68,
+      "llamacpp": 37.9,
+      "prompt_fastgguf": 717.1,
+      "prompt_llamacpp": 413.2,
+      "long_fastgguf": 72.23,
+      "long_llamacpp": 39.2
     },
     {
       "model": "qwen2.5-0.5b-q4_k_m",
       "gb": 0.395,
-      "fastgguf": 86.95,
-      "llamacpp": 55.2,
-      "prompt_fastgguf": 733.5,
-      "prompt_llamacpp": 451.4,
-      "long_fastgguf": 71.41,
-      "long_llamacpp": 47.1
+      "fastgguf": 83.85,
+      "llamacpp": 42.0,
+      "prompt_fastgguf": 718.0,
+      "prompt_llamacpp": 453.7,
+      "long_fastgguf": 68.58,
+      "long_llamacpp": 38.7
     },
     {
       "model": "llama-3.2-1b-q4_0",
       "gb": 0.698,
-      "fastgguf": 40.94,
-      "llamacpp": 39.7,
-      "prompt_fastgguf": 349.7,
-      "prompt_llamacpp": 245.4,
-      "long_fastgguf": 32.6,
-      "long_llamacpp": 26.9
+      "fastgguf": 40.69,
+      "llamacpp": 32.2,
+      "prompt_fastgguf": 344.4,
+      "prompt_llamacpp": 248.9,
+      "long_fastgguf": 33.48,
+      "long_llamacpp": 24.3
     },
     {
       "model": "llama-3.2-1b-q8_0",
       "gb": 1.316,
-      "fastgguf": 24.31,
-      "llamacpp": 21.3,
-      "prompt_fastgguf": 327.7,
-      "prompt_llamacpp": 174.6,
-      "long_fastgguf": 24.92,
-      "long_llamacpp": 18.8
+      "fastgguf": 29.25,
+      "llamacpp": 20.8,
+      "prompt_fastgguf": 323.2,
+      "prompt_llamacpp": 175.7,
+      "long_fastgguf": 24.54,
+      "long_llamacpp": 18.4
     },
     {
       "model": "llama-3.2-1b-q4_k_m",
       "gb": 0.803,
-      "fastgguf": 37.13,
-      "llamacpp": 35.9,
-      "prompt_fastgguf": 332.7,
-      "prompt_llamacpp": 290.5,
-      "long_fastgguf": 31.43,
-      "long_llamacpp": 28.2
+      "fastgguf": 41.91,
+      "llamacpp": 32.6,
+      "prompt_fastgguf": 309.3,
+      "prompt_llamacpp": 277.9,
+      "long_fastgguf": 37.47,
+      "long_llamacpp": 28.4
     },
     {
       "model": "gemma-3-1b-q4_k_m",
       "gb": 0.806,
-      "fastgguf": 33.13,
-      "llamacpp": 24.6,
-      "prompt_fastgguf": 312.2,
-      "prompt_llamacpp": 234.2,
-      "long_fastgguf": 34.49,
-      "long_llamacpp": 24.2
+      "fastgguf": 36.64,
+      "llamacpp": 23.5,
+      "prompt_fastgguf": 311.0,
+      "prompt_llamacpp": 229.9,
+      "long_fastgguf": 37.21,
+      "long_llamacpp": 22.9
     },
     {
       "model": "qwen2.5-1.5b-q4_k_m",
       "gb": 0.983,
-      "fastgguf": 30.2,
-      "llamacpp": 27.6,
-      "prompt_fastgguf": 241.7,
-      "prompt_llamacpp": 199.6,
-      "long_fastgguf": 29.06,
-      "long_llamacpp": 24.2
+      "fastgguf": 33.18,
+      "llamacpp": 26.4,
+      "prompt_fastgguf": 227.4,
+      "prompt_llamacpp": 207.4,
+      "long_fastgguf": 30.37,
+      "long_llamacpp": 24.1
     },
     {
       "model": "llama-3.2-3b-q4_k_m",
       "gb": 2.014,
-      "fastgguf": 12.92,
-      "llamacpp": 14.0,
-      "prompt_fastgguf": 116.3,
-      "prompt_llamacpp": 96.5,
-      "long_fastgguf": 11.88,
-      "long_llamacpp": 10.1
+      "fastgguf": 14.76,
+      "llamacpp": 13.7,
+      "prompt_fastgguf": 107.3,
+      "prompt_llamacpp": 99.2,
+      "long_fastgguf": 12.33,
+      "long_llamacpp": 10.2
     },
     {
       "model": "qwen3-4b-q4_k_m",
       "gb": 2.495,
-      "fastgguf": 9.61,
-      "llamacpp": 11.4,
-      "prompt_fastgguf": 87.5,
-      "prompt_llamacpp": 71.2,
-      "long_fastgguf": 8.42,
-      "long_llamacpp": 7.5
+      "fastgguf": 11.84,
+      "llamacpp": 10.7,
+      "prompt_fastgguf": 83.4,
+      "prompt_llamacpp": 73.6,
+      "long_fastgguf": 9.49,
+      "long_llamacpp": 7.4
     },
     {
       "model": "llama-3.1-8b-q4_k_m",
       "gb": 4.916,
-      "fastgguf": 5.96,
+      "fastgguf": 7.25,
       "llamacpp": 6.4,
-      "prompt_fastgguf": 52.1,
-      "prompt_llamacpp": 41.3,
-      "long_fastgguf": 5.34,
-      "long_llamacpp": 5.3
+      "prompt_fastgguf": 48.4,
+      "prompt_llamacpp": 41.1,
+      "long_fastgguf": 6.1,
+      "long_llamacpp": 5.4
     }
   ],
   "threads": [
     {
       "threads": 1,
-      "fastgguf": 13.57,
+      "fastgguf": 13.7,
       "llamacpp": 10.7
     },
     {
       "threads": 2,
-      "fastgguf": 23.3,
-      "llamacpp": 19.6
+      "fastgguf": 24.1,
+      "llamacpp": 18.0
     },
     {
       "threads": 4,
-      "fastgguf": 37.69,
-      "llamacpp": 35.1
+      "fastgguf": 48.9,
+      "llamacpp": 36.8
     }
   ]
 }
