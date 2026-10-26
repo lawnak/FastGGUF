@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build (portable: AVX-512 VNNI / AVX-VNNI / AVX2 / x86-64 in one binary)
+      - name: "Build (portable: AVX-512 VNNI / AVX-VNNI / AVX2 / x86-64 in one binary)"
         run: make portable
       - name: Self-test every build this CPU can run
         run: |
@@ -65,7 +65,7 @@ jobs:
         with:
           msystem: UCRT64
           install: make mingw-w64-ucrt-x86_64-toolchain
-      - name: Build (portable: AVX-512 VNNI / AVX-VNNI / AVX2 / x86-64 in one .exe)
+      - name: "Build (portable: AVX-512 VNNI / AVX-VNNI / AVX2 / x86-64 in one .exe)"
         run: make portable
       - name: No DLLs besides Windows' own
         run: |
