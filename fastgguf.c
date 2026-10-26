@@ -2240,7 +2240,17 @@ static int matvec(tensor_t *t, const float *x, float *out) {
 
 #if defined(__AVX2__)
 #define GV 8                          // tokens per vector (8 int32 lanes)
-#define GT 4                          // vectors per microkernel call → 32 tokens
+// microkernel tile: GEMM_NR weight rows × GEMM_NV vectors of GV tokens. Each step loads GEMM_NV
+// activation vectors and broadcasts GEMM_NR weight words for GEMM_NR·GEMM_NV dpbusd, so more rows
+// means less traffic from L2 per multiply. The accumulators must fit in the registers: 4×2 with
+// AVX-512's 32, 2×2 with AVX2's 16 (measured on Llama 3.2 3B: +35 % / +44 % over 2×4 / 1×4)
+#if defined(__AVX512VL__)
+#define GEMM_NR 4
+#define GEMM_NV 2
+#else
+#define GEMM_NR 2
+#define GEMM_NV 2
+#endif
 static inline __m256i dp_u8s8(__m256i acc, __m256i a, __m256i b) {
 #if defined(__AVXVNNI__)
     return _mm256_dpbusd_avx_epi32(acc, a, b);
@@ -2271,9 +2281,9 @@ static void gemm_alloc(int max_cols) {
     g_gsc = (float **)malloc(nt * sizeof(*g_gsc));
     g_gmn = (float **)malloc(nt * sizeof(*g_gmn));
     for (int i = 0; i < nt; i++) {
-        g_gq[i] = (uint8_t *)malloc(2 * ((size_t)max_cols + 64));                // room for 2 rows
-        g_gsc[i] = (float *)malloc(2 * ((size_t)max_cols / 16 + 1) * sizeof(float));
-        g_gmn[i] = (float *)malloc(2 * ((size_t)max_cols / 16 + 1) * sizeof(float));
+        g_gq[i] = (uint8_t *)malloc(GEMM_NR * ((size_t)max_cols + 64));          // room for GEMM_NR rows
+        g_gsc[i] = (float *)malloc(GEMM_NR * ((size_t)max_cols / 16 + 1) * sizeof(float));
+        g_gmn[i] = (float *)malloc(GEMM_NR * ((size_t)max_cols / 16 + 1) * sizeof(float));
     }
     size_t tok = FG_BATCH + GV;   // room for padding to a whole vector
     g_gpk = (int8_t *)malloc(tok * (size_t)max_cols + 64);
@@ -2348,184 +2358,102 @@ static void gemm_pack(const q8k_blk_t *xk, size_t sk, int nb, int cols, int msz)
     }
 }
 
-// one weight row × GT vectors of tokens (starting at vector c0) → Y[(token)·ldy + r]
-// gsz = group size of the scales (32 Q4_K / 16 Q6_K), msz = group size of the min terms
-static void gemm_row_x4(const uint8_t *q, const float *wsc, const float *wmn, int cols, int gsz, int msz,
-                        int c0, float *Y, int ldy, int64_t r, int nb) {
-    int nbl = cols / 256, nk4 = cols / 4, ng = cols / msz;
-    __m256 f0 = _mm256_setzero_ps(), f1 = f0, f2 = f0, f3 = f0;
-    const int8_t *B0 = g_gpk + (size_t)(c0 + 0) * nk4 * GV * 4, *B1 = g_gpk + (size_t)(c0 + 1) * nk4 * GV * 4;
-    const int8_t *B2 = g_gpk + (size_t)(c0 + 2) * nk4 * GV * 4, *B3 = g_gpk + (size_t)(c0 + 3) * nk4 * GV * 4;
+// NR weight rows × NV vectors of tokens for Q4_K (GS = MS = 32) / Q6_K (GS = MS = 16); every
+// parameter in capitals is a constant after inlining, so the accumulators stay in registers
+static inline __attribute__((always_inline))
+void gemmk_kern(const int NR, const int NV, const int GS, const int MS,
+                const uint8_t *q, const float *wsc, const float *wmn, size_t qoff, size_t soff,
+                int cols, int c0, float *Y, int ldy, int64_t r, int nb) {
+    int nbl = cols / 256, nk4 = cols / 4, ng = cols / MS;
+    const int8_t *P[4];
+    for (int v = 0; v < NV; v++) P[v] = g_gpk + (size_t)(c0 + v) * nk4 * GV * 4;
+    __m256 f[4][4];
+    for (int k = 0; k < NR; k++) for (int v = 0; v < NV; v++) f[k][v] = _mm256_setzero_ps();
     for (int b = 0; b < nbl; b++) {
-        __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
-        for (int g = 0; g < 256 / gsz; g++) {
-            __m256i i0 = _mm256_setzero_si256(), i1 = i0, i2 = i0, i3 = i0;
-            int k0 = 256 * b + gsz * g;
-            const uint8_t *qa = q + k0;
-            size_t o = (size_t)k0 * GV;              // packed: 4 values × GV tokens per 4 weights
-            for (int s = 0; s < gsz / 4; s++, qa += 4, o += 4 * GV) {
-                int32_t w4; memcpy(&w4, qa, 4);
-                __m256i a = _mm256_set1_epi32(w4);
-                i0 = dp_u8s8(i0, a, _mm256_loadu_si256((const __m256i *)(B0 + o)));
-                i1 = dp_u8s8(i1, a, _mm256_loadu_si256((const __m256i *)(B1 + o)));
-                i2 = dp_u8s8(i2, a, _mm256_loadu_si256((const __m256i *)(B2 + o)));
-                i3 = dp_u8s8(i3, a, _mm256_loadu_si256((const __m256i *)(B3 + o)));
-            }
-            __m256 ws = _mm256_set1_ps(wsc[k0 / gsz]);
-            a0 = _mm256_fmadd_ps(ws, _mm256_cvtepi32_ps(i0), a0);
-            a1 = _mm256_fmadd_ps(ws, _mm256_cvtepi32_ps(i1), a1);
-            a2 = _mm256_fmadd_ps(ws, _mm256_cvtepi32_ps(i2), a2);
-            a3 = _mm256_fmadd_ps(ws, _mm256_cvtepi32_ps(i3), a3);
-        }
-        for (int g = 0; g < 256 / msz; g++) {        // min / offset term: Σ_g wmn_g · Σy_g
-            int gi = b * (256 / msz) + g;
-            __m256 wm = _mm256_set1_ps(wmn[gi]);
-            a0 = _mm256_fnmadd_ps(wm, _mm256_loadu_ps(g_gbs + ((size_t)(c0 + 0) * ng + gi) * GV), a0);
-            a1 = _mm256_fnmadd_ps(wm, _mm256_loadu_ps(g_gbs + ((size_t)(c0 + 1) * ng + gi) * GV), a1);
-            a2 = _mm256_fnmadd_ps(wm, _mm256_loadu_ps(g_gbs + ((size_t)(c0 + 2) * ng + gi) * GV), a2);
-            a3 = _mm256_fnmadd_ps(wm, _mm256_loadu_ps(g_gbs + ((size_t)(c0 + 3) * ng + gi) * GV), a3);
-        }
-        f0 = _mm256_fmadd_ps(a0, _mm256_loadu_ps(g_gyd + ((size_t)(c0 + 0) * nbl + b) * GV), f0);
-        f1 = _mm256_fmadd_ps(a1, _mm256_loadu_ps(g_gyd + ((size_t)(c0 + 1) * nbl + b) * GV), f1);
-        f2 = _mm256_fmadd_ps(a2, _mm256_loadu_ps(g_gyd + ((size_t)(c0 + 2) * nbl + b) * GV), f2);
-        f3 = _mm256_fmadd_ps(a3, _mm256_loadu_ps(g_gyd + ((size_t)(c0 + 3) * nbl + b) * GV), f3);
-    }
-    float o[4 * GV];
-    _mm256_storeu_ps(o, f0); _mm256_storeu_ps(o + GV, f1); _mm256_storeu_ps(o + 2 * GV, f2); _mm256_storeu_ps(o + 3 * GV, f3);
-    for (int i = 0; i < 4 * GV; i++) {
-        int tok = c0 * GV + i;
-        if (tok < nb) Y[(size_t)tok * ldy + r] = o[i];
-    }
-}
-
-#if defined(__AVX512VL__)
-// two weight rows × GT vectors: 8 independent dpbusd chains share each load of the activations
-// (24 accumulator registers: only with AVX-512's 32 vector registers)
-static void gemm_row2_x4(const uint8_t *qA, const float *scA, const float *mnA,
-                         const uint8_t *qB, const float *scB, const float *mnB,
-                         int cols, int gsz, int msz, int c0, float *Y, int ldy, int64_t r, int nb) {
-    int nbl = cols / 256, nk4 = cols / 4, ng = cols / msz;
-    const int8_t *P0 = g_gpk + (size_t)(c0 + 0) * nk4 * GV * 4, *P1 = g_gpk + (size_t)(c0 + 1) * nk4 * GV * 4;
-    const int8_t *P2 = g_gpk + (size_t)(c0 + 2) * nk4 * GV * 4, *P3 = g_gpk + (size_t)(c0 + 3) * nk4 * GV * 4;
-    __m256 fA0 = _mm256_setzero_ps(), fA1 = fA0, fA2 = fA0, fA3 = fA0, fB0 = fA0, fB1 = fA0, fB2 = fA0, fB3 = fA0;
-    for (int b = 0; b < nbl; b++) {
-        __m256 aA0 = _mm256_setzero_ps(), aA1 = aA0, aA2 = aA0, aA3 = aA0, aB0 = aA0, aB1 = aA0, aB2 = aA0, aB3 = aA0;
-        for (int g = 0; g < 256 / gsz; g++) {
-            __m256i iA0 = _mm256_setzero_si256(), iA1 = iA0, iA2 = iA0, iA3 = iA0;
-            __m256i iB0 = iA0, iB1 = iA0, iB2 = iA0, iB3 = iA0;
-            int k0 = 256 * b + gsz * g;
-            const uint8_t *qa = qA + k0, *qb = qB + k0;
+        __m256 a[4][4];
+        for (int k = 0; k < NR; k++) for (int v = 0; v < NV; v++) a[k][v] = _mm256_setzero_ps();
+        for (int g = 0; g < 256 / GS; g++) {
+            __m256i ia[4][4];
+            for (int k = 0; k < NR; k++) for (int v = 0; v < NV; v++) ia[k][v] = _mm256_setzero_si256();
+            int k0 = 256 * b + GS * g;
             size_t o = (size_t)k0 * GV;
-            for (int s = 0; s < gsz / 4; s++, qa += 4, qb += 4, o += 4 * GV) {
-                int32_t wa, wb; memcpy(&wa, qa, 4); memcpy(&wb, qb, 4);
-                __m256i va = _mm256_set1_epi32(wa), vb = _mm256_set1_epi32(wb);
-                __m256i x0 = _mm256_loadu_si256((const __m256i *)(P0 + o)), x1 = _mm256_loadu_si256((const __m256i *)(P1 + o));
-                __m256i x2 = _mm256_loadu_si256((const __m256i *)(P2 + o)), x3 = _mm256_loadu_si256((const __m256i *)(P3 + o));
-                iA0 = dp_u8s8(iA0, va, x0); iA1 = dp_u8s8(iA1, va, x1); iA2 = dp_u8s8(iA2, va, x2); iA3 = dp_u8s8(iA3, va, x3);
-                iB0 = dp_u8s8(iB0, vb, x0); iB1 = dp_u8s8(iB1, vb, x1); iB2 = dp_u8s8(iB2, vb, x2); iB3 = dp_u8s8(iB3, vb, x3);
+            for (int s = 0; s < GS / 4; s++, o += 4 * GV) {
+                __m256i x[4], w[4];
+                for (int v = 0; v < NV; v++) x[v] = _mm256_loadu_si256((const __m256i *)(P[v] + o));
+                for (int k = 0; k < NR; k++) { int32_t w4; memcpy(&w4, q + k * qoff + k0 + 4 * s, 4); w[k] = _mm256_set1_epi32(w4); }
+                for (int k = 0; k < NR; k++) for (int v = 0; v < NV; v++) ia[k][v] = dp_u8s8(ia[k][v], w[k], x[v]);
             }
-            __m256 wa = _mm256_set1_ps(scA[k0 / gsz]), wb = _mm256_set1_ps(scB[k0 / gsz]);
-            aA0 = _mm256_fmadd_ps(wa, _mm256_cvtepi32_ps(iA0), aA0); aA1 = _mm256_fmadd_ps(wa, _mm256_cvtepi32_ps(iA1), aA1);
-            aA2 = _mm256_fmadd_ps(wa, _mm256_cvtepi32_ps(iA2), aA2); aA3 = _mm256_fmadd_ps(wa, _mm256_cvtepi32_ps(iA3), aA3);
-            aB0 = _mm256_fmadd_ps(wb, _mm256_cvtepi32_ps(iB0), aB0); aB1 = _mm256_fmadd_ps(wb, _mm256_cvtepi32_ps(iB1), aB1);
-            aB2 = _mm256_fmadd_ps(wb, _mm256_cvtepi32_ps(iB2), aB2); aB3 = _mm256_fmadd_ps(wb, _mm256_cvtepi32_ps(iB3), aB3);
-        }
-        for (int g = 0; g < 256 / msz; g++) {
-            int gi = b * (256 / msz) + g;
-            __m256 ma = _mm256_set1_ps(mnA[gi]), mb = _mm256_set1_ps(mnB[gi]);
-            __m256 s0 = _mm256_loadu_ps(g_gbs + ((size_t)(c0 + 0) * ng + gi) * GV), s1 = _mm256_loadu_ps(g_gbs + ((size_t)(c0 + 1) * ng + gi) * GV);
-            __m256 s2 = _mm256_loadu_ps(g_gbs + ((size_t)(c0 + 2) * ng + gi) * GV), s3 = _mm256_loadu_ps(g_gbs + ((size_t)(c0 + 3) * ng + gi) * GV);
-            aA0 = _mm256_fnmadd_ps(ma, s0, aA0); aA1 = _mm256_fnmadd_ps(ma, s1, aA1); aA2 = _mm256_fnmadd_ps(ma, s2, aA2); aA3 = _mm256_fnmadd_ps(ma, s3, aA3);
-            aB0 = _mm256_fnmadd_ps(mb, s0, aB0); aB1 = _mm256_fnmadd_ps(mb, s1, aB1); aB2 = _mm256_fnmadd_ps(mb, s2, aB2); aB3 = _mm256_fnmadd_ps(mb, s3, aB3);
-        }
-        __m256 y0 = _mm256_loadu_ps(g_gyd + ((size_t)(c0 + 0) * nbl + b) * GV), y1 = _mm256_loadu_ps(g_gyd + ((size_t)(c0 + 1) * nbl + b) * GV);
-        __m256 y2 = _mm256_loadu_ps(g_gyd + ((size_t)(c0 + 2) * nbl + b) * GV), y3 = _mm256_loadu_ps(g_gyd + ((size_t)(c0 + 3) * nbl + b) * GV);
-        fA0 = _mm256_fmadd_ps(aA0, y0, fA0); fA1 = _mm256_fmadd_ps(aA1, y1, fA1); fA2 = _mm256_fmadd_ps(aA2, y2, fA2); fA3 = _mm256_fmadd_ps(aA3, y3, fA3);
-        fB0 = _mm256_fmadd_ps(aB0, y0, fB0); fB1 = _mm256_fmadd_ps(aB1, y1, fB1); fB2 = _mm256_fmadd_ps(aB2, y2, fB2); fB3 = _mm256_fmadd_ps(aB3, y3, fB3);
-    }
-    float oA[4 * GV], oB[4 * GV];
-    _mm256_storeu_ps(oA, fA0); _mm256_storeu_ps(oA + GV, fA1); _mm256_storeu_ps(oA + 2 * GV, fA2); _mm256_storeu_ps(oA + 3 * GV, fA3);
-    _mm256_storeu_ps(oB, fB0); _mm256_storeu_ps(oB + GV, fB1); _mm256_storeu_ps(oB + 2 * GV, fB2); _mm256_storeu_ps(oB + 3 * GV, fB3);
-    for (int i = 0; i < 4 * GV; i++) {
-        int tok = c0 * GV + i;
-        if (tok < nb) { Y[(size_t)tok * ldy + r] = oA[i]; Y[(size_t)tok * ldy + r + 1] = oB[i]; }
-    }
-}
-#endif
-
-// the same for a single vector of tokens (the remainder when the batch is not a multiple of 32)
-static void gemm_row_x1(const uint8_t *q, const float *wsc, const float *wmn, int cols, int gsz, int msz,
-                        int c0, float *Y, int ldy, int64_t r, int nb) {
-    int nbl = cols / 256, nk4 = cols / 4, ng = cols / msz;
-    __m256 f0 = _mm256_setzero_ps();
-    const int8_t *B0 = g_gpk + (size_t)c0 * nk4 * GV * 4;
-    for (int b = 0; b < nbl; b++) {
-        __m256 a0 = _mm256_setzero_ps();
-        for (int g = 0; g < 256 / gsz; g++) {
-            __m256i i0 = _mm256_setzero_si256();
-            int k0 = 256 * b + gsz * g;
-            const uint8_t *qa = q + k0;
-            size_t o = (size_t)k0 * GV;
-            for (int s = 0; s < gsz / 4; s++, qa += 4, o += 4 * GV) {
-                int32_t w4; memcpy(&w4, qa, 4);
-                i0 = dp_u8s8(i0, _mm256_set1_epi32(w4), _mm256_loadu_si256((const __m256i *)(B0 + o)));
+            for (int k = 0; k < NR; k++) {
+                __m256 ws = _mm256_set1_ps(wsc[k * soff + k0 / GS]);
+                for (int v = 0; v < NV; v++) a[k][v] = _mm256_fmadd_ps(ws, _mm256_cvtepi32_ps(ia[k][v]), a[k][v]);
             }
-            a0 = _mm256_fmadd_ps(_mm256_set1_ps(wsc[k0 / gsz]), _mm256_cvtepi32_ps(i0), a0);
         }
-        for (int g = 0; g < 256 / msz; g++) {
-            int gi = b * (256 / msz) + g;
-            a0 = _mm256_fnmadd_ps(_mm256_set1_ps(wmn[gi]), _mm256_loadu_ps(g_gbs + ((size_t)c0 * ng + gi) * GV), a0);
+        for (int g = 0; g < 256 / MS; g++) {
+            int gi = b * (256 / MS) + g;
+            __m256 sv[4];
+            for (int v = 0; v < NV; v++) sv[v] = _mm256_loadu_ps(g_gbs + ((size_t)(c0 + v) * ng + gi) * GV);
+            for (int k = 0; k < NR; k++) {
+                __m256 wm = _mm256_set1_ps(wmn[k * soff + gi]);
+                for (int v = 0; v < NV; v++) a[k][v] = _mm256_fnmadd_ps(wm, sv[v], a[k][v]);
+            }
         }
-        f0 = _mm256_fmadd_ps(a0, _mm256_loadu_ps(g_gyd + ((size_t)c0 * nbl + b) * GV), f0);
+        for (int v = 0; v < NV; v++) {
+            __m256 yd = _mm256_loadu_ps(g_gyd + ((size_t)(c0 + v) * nbl + b) * GV);
+            for (int k = 0; k < NR; k++) f[k][v] = _mm256_fmadd_ps(a[k][v], yd, f[k][v]);
+        }
     }
-    float o[GV];
-    _mm256_storeu_ps(o, f0);
-    for (int i = 0; i < GV; i++) {
-        int tok = c0 * GV + i;
-        if (tok < nb) Y[(size_t)tok * ldy + r] = o[i];
-    }
+    for (int k = 0; k < NR; k++)
+        for (int v = 0; v < NV; v++) {
+            float o[GV];
+            _mm256_storeu_ps(o, f[k][v]);
+            for (int i = 0; i < GV; i++) {
+                int tok = (c0 + v) * GV + i;
+                if (tok < nb) Y[(size_t)tok * ldy + r + k] = o[i];
+            }
+        }
 }
 
-// Y = W · X for a Q4_K / Q6_K weight and nb ≥ GV tokens already quantized to Q8_K (xk, stride sk)
+#define GK_WRAP(NAME, NR, NV) \
+static void NAME##_q4(const uint8_t *q, const float *sc, const float *mn, size_t qo, size_t so, int cols, int c0, float *Y, int ldy, int64_t r, int nb) { gemmk_kern(NR, NV, 32, 32, q, sc, mn, qo, so, cols, c0, Y, ldy, r, nb); } \
+static void NAME##_q6(const uint8_t *q, const float *sc, const float *mn, size_t qo, size_t so, int cols, int c0, float *Y, int ldy, int64_t r, int nb) { gemmk_kern(NR, NV, 16, 16, q, sc, mn, qo, so, cols, c0, Y, ldy, r, nb); }
+GK_WRAP(gk_main, GEMM_NR, GEMM_NV)
+GK_WRAP(gk_r1v1, 1, 1)
+GK_WRAP(gk_r1vm, 1, GEMM_NV)
+
+// Y = W · X for a Q4_K / Q6_K weight and nb ≥ GV tokens already quantized to Q8_K (xk, stride sk):
+// GEMM_NR rows are unpacked together and multiplied with GEMM_NV vectors of tokens at a time
 static void gemm_kquant(tensor_t *t, int cols, int64_t rows, const q8k_blk_t *xk, size_t sk,
                         float *Y, int ldy, int nb) {
     int q6 = t->type == T_Q6_K;
-    int gsz = q6 ? 16 : 32, msz = q6 ? 16 : 32, nbl = cols / 256;
+    int msz = q6 ? 16 : 32, nbl = cols / 256;
     uint64_t stride = row_stride(t->type, (uint64_t)cols);
     gemm_alloc(g_max_cols);
     gemm_pack(xk, sk, nb, cols, msz);
     int nvec = (nb + GV - 1) / GV;
-#if defined(__AVX512VL__)
-    const int RP = 2;                   // rows per step (2-row kernel)
-#else
-    const int RP = 1;
-#endif
     size_t qoff = (size_t)g_gemm_cols + 64, soff = (size_t)g_gemm_cols / 16 + 1;
-    int64_t nsteps = (rows + RP - 1) / RP;
+    int64_t nsteps = (rows + GEMM_NR - 1) / GEMM_NR;
     #pragma omp parallel for schedule(static)
     for (int64_t st = 0; st < nsteps; st++) {
         int th = omp_get_thread_num();
-        int64_t r = st * RP;
-        int two = RP == 2 && r + 1 < rows;
-        for (int k = 0; k <= two; k++) {
+        int64_t r = st * GEMM_NR;
+        int nr = rows - r < GEMM_NR ? (int)(rows - r) : GEMM_NR;
+        for (int k = 0; k < nr; k++) {
             const uint8_t *rb = t->data + (uint64_t)(r + k) * stride;
             if (q6) unpack_row_q6_K(rb, nbl, g_gq[th] + k * qoff, g_gsc[th] + k * soff, g_gmn[th] + k * soff);
             else    unpack_row_q4_K(rb, nbl, g_gq[th] + k * qoff, g_gsc[th] + k * soff, g_gmn[th] + k * soff);
         }
         const uint8_t *q = g_gq[th];
-        const float *wsc = g_gsc[th], *wmn = g_gmn[th];
+        const float *sc = g_gsc[th], *mn = g_gmn[th];
         int c = 0;
-#if defined(__AVX512VL__)
-        if (two)
-            for (; c + GT <= nvec; c += GT)
-                gemm_row2_x4(q, wsc, wmn, q + qoff, wsc + soff, wmn + soff, cols, gsz, msz, c, Y, ldy, r, nb);
-#endif
-        for (int k = 0; k <= two; k++) {
+        if (nr == GEMM_NR)
+            for (; c + GEMM_NV <= nvec; c += GEMM_NV)
+                (q6 ? gk_main_q6 : gk_main_q4)(q, sc, mn, qoff, soff, cols, c, Y, ldy, r, nb);
+        for (int k = 0; k < nr; k++) {
             int cc = c;
-            for (; cc + GT <= nvec; cc += GT)
-                gemm_row_x4(q + k * qoff, wsc + k * soff, wmn + k * soff, cols, gsz, msz, cc, Y, ldy, r + k, nb);
+            for (; cc + GEMM_NV <= nvec; cc += GEMM_NV)
+                (q6 ? gk_r1vm_q6 : gk_r1vm_q4)(q + k * qoff, sc + k * soff, mn + k * soff, 0, 0, cols, cc, Y, ldy, r + k, nb);
             for (; cc < nvec; cc++)
-                gemm_row_x1(q + k * qoff, wsc + k * soff, wmn + k * soff, cols, gsz, msz, cc, Y, ldy, r + k, nb);
+                (q6 ? gk_r1v1_q6 : gk_r1v1_q4)(q + k * qoff, sc + k * soff, mn + k * soff, 0, 0, cols, cc, Y, ldy, r + k, nb);
         }
     }
 }
@@ -2598,16 +2526,16 @@ static inline __attribute__((always_inline))
 void gemm32_kern(const int NR, const int NV, const uint8_t *q, const float *wsc, const float *wmn,
                  size_t qoff, size_t soff, int cols, int c0, float *Y, int ldy, int64_t r, int nb) {
     int ng = cols / 32, nk4 = cols / 4;
-    __m256 acc[2][4];
+    __m256 acc[4][4];
     const int8_t *P[4];
     for (int v = 0; v < NV; v++) P[v] = g_gpk + (size_t)(c0 + v) * nk4 * GV * 4;
     for (int k = 0; k < NR; k++) for (int v = 0; v < NV; v++) acc[k][v] = _mm256_setzero_ps();
     for (int g = 0; g < ng; g++) {
-        __m256i ia[2][4];
+        __m256i ia[4][4];
         for (int k = 0; k < NR; k++) for (int v = 0; v < NV; v++) ia[k][v] = _mm256_setzero_si256();
         size_t o = (size_t)g * 32 * GV;
         for (int s = 0; s < 8; s++, o += 4 * GV) {
-            __m256i x[4], w[2];
+            __m256i x[4], w[4];
             for (int v = 0; v < NV; v++) x[v] = _mm256_loadu_si256((const __m256i *)(P[v] + o));
             for (int k = 0; k < NR; k++) {
                 int32_t w4; memcpy(&w4, q + k * qoff + 32 * g + 4 * s, 4);
@@ -2636,11 +2564,9 @@ void gemm32_kern(const int NR, const int NV, const uint8_t *q, const float *wsc,
         }
 }
 
+static void gemm32_main(const uint8_t *q, const float *sc, const float *mn, size_t qo, size_t so, int cols, int c0, float *Y, int ldy, int64_t r, int nb) { gemm32_kern(GEMM_NR, GEMM_NV, q, sc, mn, qo, so, cols, c0, Y, ldy, r, nb); }
+static void gemm32_r1vn(const uint8_t *q, const float *sc, const float *mn, size_t qo, size_t so, int cols, int c0, float *Y, int ldy, int64_t r, int nb) { gemm32_kern(1, GEMM_NV, q, sc, mn, qo, so, cols, c0, Y, ldy, r, nb); }
 static void gemm32_r1v1(const uint8_t *q, const float *sc, const float *mn, size_t qo, size_t so, int cols, int c0, float *Y, int ldy, int64_t r, int nb) { gemm32_kern(1, 1, q, sc, mn, qo, so, cols, c0, Y, ldy, r, nb); }
-static void gemm32_r1v4(const uint8_t *q, const float *sc, const float *mn, size_t qo, size_t so, int cols, int c0, float *Y, int ldy, int64_t r, int nb) { gemm32_kern(1, 4, q, sc, mn, qo, so, cols, c0, Y, ldy, r, nb); }
-#if defined(__AVX512VL__)
-static void gemm32_r2v4(const uint8_t *q, const float *sc, const float *mn, size_t qo, size_t so, int cols, int c0, float *Y, int ldy, int64_t r, int nb) { gemm32_kern(2, 4, q, sc, mn, qo, so, cols, c0, Y, ldy, r, nb); }
-#endif
 
 // Y = W · X for a 32-block weight and nb ≥ GV tokens already quantized to Q8 (xq, stride s8)
 static void gemm_q32(tensor_t *t, int cols, int64_t rows, const q8_blk_t *xq, size_t s8,
@@ -2649,32 +2575,25 @@ static void gemm_q32(tensor_t *t, int cols, int64_t rows, const q8_blk_t *xq, si
     gemm_alloc(g_max_cols);
     gemm_pack_q8(xq, s8, nb, cols);
     int nvec = (nb + GV - 1) / GV, nbl = cols / 32;
-#if defined(__AVX512VL__)
-    const int RP = 2;
-#else
-    const int RP = 1;
-#endif
     size_t qoff = (size_t)g_gemm_cols + 64, soff = (size_t)g_gemm_cols / 16 + 1;
-    int64_t nsteps = (rows + RP - 1) / RP;
+    int64_t nsteps = (rows + GEMM_NR - 1) / GEMM_NR;
     #pragma omp parallel for schedule(static)
     for (int64_t st = 0; st < nsteps; st++) {
         int th = omp_get_thread_num();
-        int64_t r = st * RP;
-        int two = RP == 2 && r + 1 < rows;
-        for (int k = 0; k <= two; k++)
+        int64_t r = st * GEMM_NR;
+        int nr = rows - r < GEMM_NR ? (int)(rows - r) : GEMM_NR;
+        for (int k = 0; k < nr; k++)
             unpack_row_q32(t->type, t->data + (uint64_t)(r + k) * stride, nbl,
                            g_gq[th] + k * qoff, g_gsc[th] + k * soff, g_gmn[th] + k * soff);
         const uint8_t *q = g_gq[th];
         const float *sc = g_gsc[th], *mn = g_gmn[th];
         int c = 0;
-#if defined(__AVX512VL__)
-        if (two)
-            for (; c + GT <= nvec; c += GT) gemm32_r2v4(q, sc, mn, qoff, soff, cols, c, Y, ldy, r, nb);
-#endif
-        for (int k = 0; k <= two; k++) {
+        if (nr == GEMM_NR)
+            for (; c + GEMM_NV <= nvec; c += GEMM_NV) gemm32_main(q, sc, mn, qoff, soff, cols, c, Y, ldy, r, nb);
+        for (int k = 0; k < nr; k++) {
             int cc = c;
-            for (; cc + GT <= nvec; cc += GT)
-                gemm32_r1v4(q + k * qoff, sc + k * soff, mn + k * soff, 0, 0, cols, cc, Y, ldy, r + k, nb);
+            for (; cc + GEMM_NV <= nvec; cc += GEMM_NV)
+                gemm32_r1vn(q + k * qoff, sc + k * soff, mn + k * soff, 0, 0, cols, cc, Y, ldy, r + k, nb);
             for (; cc < nvec; cc++)
                 gemm32_r1v1(q + k * qoff, sc + k * soff, mn + k * soff, 0, 0, cols, cc, Y, ldy, r + k, nb);
         }
