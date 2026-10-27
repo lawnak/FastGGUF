@@ -1,5 +1,6 @@
 // fastgguf.c — GGUF inference engine in C with AVX2 kernels
-// Supported architectures: Gemma (gemma*) / Qwen (qwen2, qwen3, qwen3moe) / Mistral and Llama (llama)
+// Supported architectures: Gemma (gemma*) / Qwen (qwen2, qwen3, qwen3moe) / Phi (phi2, phi3) /
+// Mistral and Llama (llama)
 // Gemma path ported from the verified Go version; architecture matches llama.cpp (src/models/gemma4.cpp)
 //
 // Build (Windows with w64devkit or MSYS2):
@@ -3111,17 +3112,28 @@ static void rmsnorm_plain(float *x, int n, float eps) {
     for (int i = 0; i < n; i++) x[i] *= inv;
 }
 
+// LayerNorm with weight and bias (Phi-2): mean removed, then divided by the standard deviation
+static void layernorm_wb(float *x, const float *w, const float *b, int n, float eps) {
+    double s = 0.0, ss = 0.0;
+    for (int i = 0; i < n; i++) s += x[i];
+    float mean = (float)(s / n);
+    for (int i = 0; i < n; i++) { float d = x[i] - mean; ss += (double)d * d; }
+    float inv = (float)(1.0 / sqrt(ss / n + (double)eps));
+    for (int i = 0; i < n; i++) x[i] = (x[i] - mean) * inv * w[i] + (b ? b[i] : 0.0f);
+}
+
 static inline float gelu_f(float x) {
     return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
 }
 
 static inline float silu_f(float x) { return x / (1.0f + expf(-x)); }
 
-// RoPE on the first n_rot dims of each head
-//   neox=1: halves (Gemma/Qwen)   neox=0: adjacent pairs (Llama/Mistral)
+// RoPE on the first n_rot dims of each head (the rest pass through unchanged)
+//   neox=1: halves (Gemma/Qwen/Phi)   neox=0: adjacent pairs (Llama/Mistral)
 // freq_scale: linear position scaling (1/factor) — large Gemma 3 models use it on global layers
+// mscale: scales the rotated dims (Phi-3 LongRoPE attention factor; 1 for everything else)
 static void apply_rope(float *x, int total, int pos, int head_dim, int n_rot,
-                       double base, double freq_scale, const float *freq_factors, int neox) {
+                       double base, double freq_scale, const float *freq_factors, int neox, float mscale) {
     int half = n_rot / 2;
     // the angles depend only on the position and the pair index, not on the head: compute once
     float cs[512], sn[512];
@@ -3129,8 +3141,8 @@ static void apply_rope(float *x, int total, int pos, int head_dim, int n_rot,
     for (int j = 0; j < half; j++) {
         double theta = (double)pos * freq_scale / pow(base, (double)(2 * j) / (double)n_rot);
         if (freq_factors) theta /= (double)freq_factors[j];
-        cs[j] = (float)cos(theta);
-        sn[j] = (float)sin(theta);
+        cs[j] = (float)cos(theta) * mscale;
+        sn[j] = (float)sin(theta) * mscale;
     }
     for (int ho = 0; ho + head_dim <= total; ho += head_dim) {
         for (int j = 0; j < half; j++) {
@@ -3517,8 +3529,8 @@ static void kvq_dequant_slice(const uint8_t *rec, float *out, int hd, int bits) 
 // =========================================================================
 
 // supported chat templates
-enum { TMPL_GEMMA, TMPL_CHATML, TMPL_MISTRAL, TMPL_LLAMA3, TMPL_GEMMA4 };
-static const char *tmpl_names[] = { "gemma", "chatml", "mistral", "llama3", "gemma4" };
+enum { TMPL_GEMMA, TMPL_CHATML, TMPL_MISTRAL, TMPL_LLAMA3, TMPL_GEMMA4, TMPL_PHI3, TMPL_PHI4, TMPL_PHI2 };
+static const char *tmpl_names[] = { "gemma", "chatml", "mistral", "llama3", "gemma4", "phi3", "phi4", "phi2" };
 
 typedef struct {
     char **tokens;
@@ -3532,6 +3544,7 @@ typedef struct {
     int is_bpe;          // 1 = GPT-2 BPE (Qwen), 0 = SentencePiece (Gemma/Mistral)
     int add_bos;
     int tmpl;            // TMPL_*
+    int tmpl_nl;         // TMPL_PHI3: a newline after <|role|> and <|end|> (Phi-3 / 3.5; Phi-4-mini has none)
     const int *ttype;    // tokenizer.ggml.token_type (may be NULL)
     size_t ttype_n;
     uint16_t byte_cp[256];   // BPE: byte → codepoint (GPT-2 map)
@@ -3648,6 +3661,7 @@ static int tok_load(tok_t *t, gguf_t *g) {
     add_stop(t, tok_lookup(t, "<turn|>", 7));        // Gemma 4
     add_stop(t, tok_lookup(t, "<|im_end|>", 10));
     add_stop(t, tok_lookup(t, "<|eot_id|>", 10));
+    add_stop(t, tok_lookup(t, "<|end|>", 7));         // Phi-3 / Phi-4-mini
     add_stop(t, tok_lookup(t, "<|endoftext|>", 13));
     add_stop(t, tok_lookup(t, "</s>", 4));
 
@@ -3663,23 +3677,30 @@ static int tok_load(tok_t *t, gguf_t *g) {
     // choose the chat template: from tokenizer.chat_template first, then from vocab tokens
     kv_t *ct = kv_find(g, "tokenizer.chat_template");
     const char *cts = (ct && ct->kind == KV_STR) ? ct->str : NULL;
+    kv_t *ak = kv_find(g, "general.architecture");
+    const char *arch = (ak && ak->kind == KV_STR) ? ak->str : "";
+    int phi3_toks = tok_lookup(t, "<|assistant|>", 13) >= 0 && tok_lookup(t, "<|end|>", 7) >= 0;
     if (cts && strstr(cts, "<|turn>"))                  t->tmpl = TMPL_GEMMA4;
     else if (cts && strstr(cts, "<start_of_turn>"))     t->tmpl = TMPL_GEMMA;
+    else if (cts && strstr(cts, "<|im_sep|>"))          t->tmpl = TMPL_PHI4;   // Phi-4: ChatML with <|im_sep|>
     else if (cts && strstr(cts, "<|im_start|>"))        t->tmpl = TMPL_CHATML;
     else if (cts && strstr(cts, "<|start_header_id|>")) t->tmpl = TMPL_LLAMA3;
     else if (cts && strstr(cts, "[INST]"))              t->tmpl = TMPL_MISTRAL;
+    else if (cts && strstr(cts, "<|assistant|>") && strstr(cts, "<|end|>")) t->tmpl = TMPL_PHI3;
     else if (tok_lookup(t, "<|turn>", 7) >= 0)                   t->tmpl = TMPL_GEMMA4;
     else if (tok_lookup(t, "<start_of_turn>", 15) >= 0)          t->tmpl = TMPL_GEMMA;
+    else if (tok_lookup(t, "<|im_sep|>", 10) >= 0)               t->tmpl = TMPL_PHI4;
     else if (tok_lookup(t, "<|im_start|>", 12) >= 0)             t->tmpl = TMPL_CHATML;
     else if (tok_lookup(t, "<|start_header_id|>", 19) >= 0)      t->tmpl = TMPL_LLAMA3;
     else if (tok_lookup(t, "[INST]", 6) >= 0)                    t->tmpl = TMPL_MISTRAL;
-    else {
-        kv_t *ak = kv_find(g, "general.architecture");
-        const char *arch = (ak && ak->kind == KV_STR) ? ak->str : "";
-        if (strncmp(arch, "gemma", 5) == 0)      t->tmpl = TMPL_GEMMA;
-        else if (strncmp(arch, "qwen", 4) == 0)  t->tmpl = TMPL_CHATML;
-        else                                     t->tmpl = TMPL_MISTRAL;
-    }
+    else if (phi3_toks)                                          t->tmpl = TMPL_PHI3;
+    else if (strncmp(arch, "gemma", 5) == 0)                     t->tmpl = TMPL_GEMMA;
+    else if (strncmp(arch, "qwen", 4) == 0)                      t->tmpl = TMPL_CHATML;
+    else if (strcmp(arch, "phi2") == 0)                          t->tmpl = TMPL_PHI2;
+    else                                                         t->tmpl = TMPL_MISTRAL;
+    // Phi-3 / 3.5 put a newline after <|role|> and <|end|>; Phi-4-mini's template has none ('\n'
+    // never appears in it)
+    t->tmpl_nl = !(cts && !strstr(cts, "\\n") && !strchr(cts, '\n'));
     // the Llama 3 template always starts with <|begin_of_text|> — many files do not set add_bos_token
     // so the default (0 for BPE) would be wrong and the model would drift off context
     if (t->tmpl == TMPL_LLAMA3 && t->bos_id >= 0 && !kv_find(g, "tokenizer.ggml.add_bos_token"))
@@ -3861,6 +3882,50 @@ static int *encode_chat(tok_t *t, msg_t *msgs, int n_msgs, int add_bos, int clos
         }
         ids_push_special(t, &b, "<|turn>");
         ids_push_text(t, &b, "model\n", NULL);
+        break;
+    case TMPL_PHI3: { // <|role|>\ncontent<|end|>\n ... <|assistant|>\n (no newlines for Phi-4-mini)
+        const char *nl = t->tmpl_nl ? "\n" : "";
+        if (close_prev) { ids_push_special(t, &b, "<|end|>"); ids_push_text(t, &b, nl, NULL); }
+        for (int i = 0; i < n_msgs; i++) {
+            const char *role = strcmp(msgs[i].role, "assistant") == 0 ? "<|assistant|>"
+                             : strcmp(msgs[i].role, "system") == 0    ? "<|system|>" : "<|user|>";
+            ids_push_special(t, &b, role);
+            ids_push_text(t, &b, nl, msgs[i].content);
+            ids_push_special(t, &b, "<|end|>");
+            ids_push_text(t, &b, nl, NULL);
+        }
+        ids_push_special(t, &b, "<|assistant|>");
+        ids_push_text(t, &b, nl, NULL);
+        break;
+    }
+    case TMPL_PHI4: // <|im_start|>role<|im_sep|>content<|im_end|> — no newlines
+        if (close_prev) ids_push_special(t, &b, "<|im_end|>");
+        for (int i = 0; i < n_msgs; i++) {
+            ids_push_special(t, &b, "<|im_start|>");
+            ids_push_text(t, &b, msgs[i].role, NULL);
+            ids_push_special(t, &b, "<|im_sep|>");
+            ids_push_text(t, &b, msgs[i].content, NULL);
+            ids_push_special(t, &b, "<|im_end|>");
+        }
+        ids_push_special(t, &b, "<|im_start|>");
+        ids_push_text(t, &b, "assistant", NULL);
+        ids_push_special(t, &b, "<|im_sep|>");
+        break;
+    case TMPL_PHI2: // no chat template: the "Instruct: ...\nOutput:" format of the Phi-2 model card
+        if (close_prev) ids_push_text(t, &b, "\n", NULL);
+        for (int i = 0; i < n_msgs; i++) {
+            if (strcmp(msgs[i].role, "assistant") == 0) {
+                ids_push_text(t, &b, " ", msgs[i].content);
+                ids_push_text(t, &b, "\n", NULL);
+            } else if (strcmp(msgs[i].role, "system") == 0) {
+                ids_push_text(t, &b, msgs[i].content, "\n");
+            } else {
+                ids_push_text(t, &b, "Instruct: ", msgs[i].content);
+                if (i + 1 < n_msgs)
+                    ids_push_text(t, &b, strcmp(msgs[i + 1].role, "assistant") == 0 ? "\nOutput:" : "\n", NULL);
+            }
+        }
+        ids_push_text(t, &b, "\nOutput:", NULL);
         break;
     default: // TMPL_GEMMA — no separate system role: treat it as a user turn
         if (close_prev) { ids_push_special(t, &b, "<end_of_turn>"); ids_push_text(t, &b, "\n", NULL); }
@@ -4062,13 +4127,18 @@ static int sample_next(sampler_t *s, tok_t *tk, float *logits, int n_vocab,
 #define MAX_LAYERS 128
 
 typedef struct {
-    float *attn_norm;
+    float *attn_norm, *attn_norm_b;  // the bias only with LayerNorm (Phi-2)
     tensor_t *wq, *wk, *wv, *wo;
-    float *bq, *bk, *bv;           // optional biases (Qwen2)
+    float *bq, *bk, *bv;           // optional biases (Qwen2, Phi-2)
+    float *bo;                     // output projection bias (Phi-2)
     float *q_norm, *k_norm;        // size = head dim (Gemma/Qwen3, may be NULL)
     float *attn_post_norm;         // optional (Gemma only)
     float *ffn_norm;
-    tensor_t *ffn_gate, *ffn_up, *ffn_down;
+    tensor_t *ffn_gate, *ffn_up, *ffn_down;  // ffn_gate NULL = plain FFN down(GELU(up·x)) (Phi-2)
+    float *ffn_up_b, *ffn_down_b;  // FFN biases (Phi-2)
+    // fused Phi weights (attn_qkv, ffn_up = gate|up) split by rows: wq/wk/wv and ffn_gate/ffn_up
+    // point here, at row ranges of the one tensor in the file — no copies
+    tensor_t split[5];
     // MoE (qwen3moe): router + experts stacked 3D [cols, rows, n_expert] — pointers into the mmap
     tensor_t *ffn_gate_inp;        // NULL = dense FFN layer
     tensor_t *ffn_gate_exps, *ffn_up_exps, *ffn_down_exps;
@@ -4090,7 +4160,10 @@ typedef struct {
     float attn_scale;
     double rope_scale;   // freq_scale for global layers only
     int act_gelu;        // 1 = GELU (Gemma), 0 = SiLU (Qwen/Mistral/Llama)
-    int rope_neox;       // 1 = halves (Gemma/Qwen), 0 = pairs (Llama/Mistral)
+    int rope_neox;       // 1 = halves (Gemma/Qwen/Phi), 0 = pairs (Llama/Mistral)
+    float rope_mscale;   // multiplies cos/sin of the rotated dims (Phi-3 LongRoPE attn_factor), else 1
+    int layer_norm;      // 1 = LayerNorm with bias (Phi-2), 0 = RMSNorm
+    int par_ffn;         // 1 = attention and FFN both read the attn_norm output and are added together (Phi-2)
     float embd_scale;
     int n_layer, n_embd, n_ple, n_swa, n_kv_from_start;
     int n_rot, n_rot_swa;
@@ -4102,7 +4175,7 @@ typedef struct {
     int n_expert, n_expert_used, ff_exp;   // MoE — 0 = dense model
 
     tensor_t *tok_embd, *output;
-    float *output_norm;
+    float *output_norm, *output_norm_b, *output_b;   // the biases only in Phi-2
     tensor_t *ple_tok_embd, *ple_model_proj;
     float *ple_proj_norm;
     float *rope_freqs;          // may be NULL
@@ -4175,6 +4248,26 @@ static int exps_shape_ok(const tensor_t *t, int cols, int rows, int n) {
            t->ne[2] == (uint64_t)n;
 }
 
+// rows [r0, r0 + n) of a 2D weight matrix as a tensor of its own: the data stays where it is in the
+// file, so a fused matrix (Phi attn_qkv, ffn_up = gate|up) becomes ordinary Q/K/V or gate/up matrices
+static tensor_t *split_rows(tensor_t *dst, const tensor_t *t, int64_t r0, int64_t n, const char *part) {
+    uint64_t stride = row_stride(t->type, t->ne[0]);
+    *dst = *t;
+    dst->data = t->data + (uint64_t)r0 * stride;
+    dst->ne[1] = (uint64_t)n;
+    dst->nbytes = (uint64_t)n * stride;
+    dst->gpu = NULL;
+    dst->rp = NULL;
+    snprintf(dst->name, sizeof(dst->name), "%.100s[%s]", t->name, part);
+    return dst;
+}
+
+// the norm before attention / FFN / output head: LayerNorm with bias for Phi-2, RMSNorm otherwise
+static void model_norm(const model_t *m, float *x, const float *w, const float *b, int n) {
+    if (m->layer_norm) layernorm_wb(x, w, b, n, m->norm_eps);
+    else rmsnorm_w(x, w, n, m->norm_eps);
+}
+
 static double now_sec(void);
 
 static int model_load(model_t *m, gguf_t *g, int n_ctx) {
@@ -4188,13 +4281,18 @@ static int model_load(model_t *m, gguf_t *g, int n_ctx) {
     char key[160];
 #define K(fmt) (snprintf(key, sizeof(key), "%s." fmt, arch), key)
 
-    // per-architecture settings — gemma* / qwen2 / qwen3 / qwen3moe / llama (includes Mistral)
+    // per-architecture settings — gemma* / qwen2 / qwen3 / qwen3moe / phi2 / phi3 / llama (includes Mistral)
     snprintf(m->arch_name, sizeof(m->arch_name), "%s", arch);
     m->is_gemma = strncmp(arch, "gemma", 5) == 0;
-    if (!m->is_gemma && strncmp(arch, "qwen", 4) != 0 &&
+    // Phi-2: LayerNorm with biases, attention and a plain GELU FFN side by side on the same input.
+    // Phi-3 (also Phi-3.5, Phi-4, Phi-4-mini): the Llama layout with fused QKV and gate|up matrices,
+    // partial rotary dims (Phi-4-mini) and LongRoPE factors (128k models) — as llama.cpp phi2.cpp / phi3.cpp
+    int is_phi2 = strcmp(arch, "phi2") == 0, is_phi3 = strcmp(arch, "phi3") == 0;
+    if (!m->is_gemma && strncmp(arch, "qwen", 4) != 0 && !is_phi2 && !is_phi3 &&
         strcmp(arch, "llama") != 0 && strcmp(arch, "mistral") != 0)
         fprintf(stderr, "[warn] arch '%s' is untested — continuing with the standard llama path\n", arch);
-    m->act_gelu = m->is_gemma;
+    m->act_gelu = m->is_gemma || is_phi2;
+    m->layer_norm = m->par_ffn = is_phi2;
     m->rope_neox = !(strcmp(arch, "llama") == 0 || strcmp(arch, "mistral") == 0);
 
     // Gemma 3 — the differences as implemented by llama.cpp (LLM_ARCH_GEMMA3); the Gemma 4 path is unchanged
@@ -4225,7 +4323,13 @@ static int model_load(model_t *m, gguf_t *g, int n_ctx) {
     m->rope_base_swa = kv_num(g, K("rope.freq_base_swa"), 10000.0);
     m->n_rot     = (int)kv_num(g, K("rope.dimension_count"), 0);
     m->n_rot_swa = (int)kv_num(g, K("rope.dimension_count_swa"), 0);
-    m->norm_eps  = (float)kv_num(g, K("attention.layer_norm_rms_epsilon"), 1e-6);
+    m->norm_eps  = (float)(m->layer_norm ? kv_num(g, K("attention.layer_norm_epsilon"), 1e-5)
+                                         : kv_num(g, K("attention.layer_norm_rms_epsilon"), 1e-6));
+    // Phi-3 files store a sliding window, but llama.cpp runs them with full attention (its SWA
+    // metadata is not reliable, see llama.cpp #13676) — do the same
+    if (is_phi3) m->n_swa = 0;
+    // LongRoPE / YaRN attention factor (Phi-3 128k models): scales cos and sin, like llama.cpp
+    m->rope_mscale = (float)kv_num(g, K("rope.scaling.attn_factor"), 1.0);
     m->final_softcap = (float)kv_num(g, K("final_logit_softcapping"), 0.0);
 
     // MoE (qwen3moe): number of experts, experts used per token, and FFN width of one expert
@@ -4269,6 +4373,10 @@ static int model_load(model_t *m, gguf_t *g, int n_ctx) {
     m->output = tensor_find(g, "output.weight");
     if (!m->output) m->output = m->tok_embd;
     m->output_norm = must_f32(g, "output_norm.weight", NULL, &err);
+    m->output_norm_b = load_f32(g, "output_norm.bias", NULL);
+    int ob_n = 0;
+    m->output_b = load_f32(g, "output.bias", &ob_n);
+    if (m->output_b && ob_n != m->n_vocab) { fprintf(stderr, "output.bias: %d values, vocab %d\n", ob_n, m->n_vocab); return -1; }
 
     if (m->n_ple > 0) {
         m->ple_tok_embd   = must_tensor(g, "per_layer_token_embd.weight", &err);
@@ -4276,11 +4384,20 @@ static int model_load(model_t *m, gguf_t *g, int n_ctx) {
         m->ple_proj_norm  = must_f32(g, "per_layer_proj_norm.weight", NULL, &err);
     }
     m->rope_freqs = load_f32(g, "rope_freqs.weight", &m->rope_freqs_n);
+    if (!m->rope_freqs) {
+        // Phi-3 LongRoPE: the long factors when the context is longer than the original training
+        // context, the short ones otherwise (llama.cpp get_rope_factors)
+        double orig = kv_num(g, K("rope.scaling.original_context_length"), 0.0);
+        if (orig <= 0.0) orig = kv_num(g, K("context_length"), 0.0);
+        m->rope_freqs = load_f32(g, n_ctx > orig ? "rope_factors_long.weight" : "rope_factors_short.weight",
+                                 &m->rope_freqs_n);
+    }
 
     // head dim from metadata (fallback when there is no q_norm)
     int meta_n_head = (int)kv_num(g, K("attention.head_count"), 0);
     int meta_head_dim = (int)kv_num(g, K("attention.key_length"), 0);
     if (meta_head_dim <= 0 && meta_n_head > 0) meta_head_dim = m->n_embd / meta_n_head;
+    int meta_n_head_kv = (int)kv_num(g, K("attention.head_count_kv"), meta_n_head);
 
     int max_cols = m->n_embd, max_q = 0, max_kv = 0, max_ff = 0;
 
@@ -4290,14 +4407,33 @@ static int model_load(model_t *m, gguf_t *g, int n_ctx) {
 #define BLK(fmt) (snprintf(nm, sizeof(nm), "blk.%d." fmt, i), nm)
 
         L->attn_norm = must_f32(g, BLK("attn_norm.weight"), NULL, &err);
-        L->wq = must_tensor(g, BLK("attn_q.weight"), &err);
+        L->attn_norm_b = load_f32(g, BLK("attn_norm.bias"), NULL);   // Phi-2
+        tensor_t *qkv = tensor_find(g, BLK("attn_qkv.weight"));
+        if (qkv) {
+            // Phi: Q, K and V stacked in one matrix of q_dim + 2·kv_dim rows
+            int nq = meta_n_head * meta_head_dim, nkv = meta_n_head_kv * meta_head_dim, bn = 0;
+            if (qkv->n_dims != 2 || nq <= 0 || nkv <= 0 || tensor_rows(qkv) != (int64_t)nq + 2 * nkv) {
+                fprintf(stderr, "L%d: attn_qkv has %lld rows, expected %d + 2x%d\n",
+                        i, (long long)tensor_rows(qkv), nq, nkv);
+                return -1;
+            }
+            L->wq = split_rows(&L->split[0], qkv, 0, nq, "q");
+            L->wk = split_rows(&L->split[1], qkv, nq, nkv, "k");
+            L->wv = split_rows(&L->split[2], qkv, nq + nkv, nkv, "v");
+            float *b = load_f32(g, BLK("attn_qkv.bias"), &bn);
+            if (b && bn != nq + 2 * nkv) { fprintf(stderr, "L%d: attn_qkv.bias has %d values\n", i, bn); return -1; }
+            if (b) { L->bq = b; L->bk = b + nq; L->bv = b + nq + nkv; }
+        } else {
+            L->wq = must_tensor(g, BLK("attn_q.weight"), &err);
+        }
         L->wo = must_tensor(g, BLK("attn_output.weight"), &err);
+        L->bo = load_f32(g, BLK("attn_output.bias"), NULL);          // Phi-2
         int qn = 0;
         L->q_norm = load_f32(g, BLK("attn_q_norm.weight"), &qn); // Gemma/Qwen3
         if (m->is_gemma && !L->q_norm) { fprintf(stderr, "missing tensor: %s\n", nm); return -1; }
         L->attn_post_norm = load_f32(g, BLK("post_attention_norm.weight"), NULL);
         if (m->is_gemma && !L->attn_post_norm) { fprintf(stderr, "missing tensor: %s\n", nm); return -1; }
-        L->bq = load_f32(g, BLK("attn_q.bias"), NULL); // Qwen2
+        if (!L->bq) L->bq = load_f32(g, BLK("attn_q.bias"), NULL); // Qwen2
         if (err) break;
 
         // true head dim = length of q_norm if present — reliable even when metadata holds per-layer arrays
@@ -4314,14 +4450,16 @@ static int model_load(model_t *m, gguf_t *g, int n_ctx) {
         }
 
         if (i < m->n_kv_from_start) {
-            L->wk = must_tensor(g, BLK("attn_k.weight"), &err);
-            L->wv = tensor_find(g, BLK("attn_v.weight")); // may be NULL in Gemma (V = K)
+            if (!qkv) {
+                L->wk = must_tensor(g, BLK("attn_k.weight"), &err);
+                L->wv = tensor_find(g, BLK("attn_v.weight")); // may be NULL in Gemma (V = K)
+            }
             if (!L->wv && !m->is_gemma) { fprintf(stderr, "missing tensor: %s\n", nm); return -1; }
             int kn = 0;
             L->k_norm = load_f32(g, BLK("attn_k_norm.weight"), &kn);
             if (m->is_gemma && !L->k_norm) { fprintf(stderr, "missing tensor: %s\n", nm); return -1; }
-            L->bk = load_f32(g, BLK("attn_k.bias"), NULL);
-            L->bv = load_f32(g, BLK("attn_v.bias"), NULL);
+            if (!L->bk) L->bk = load_f32(g, BLK("attn_k.bias"), NULL);
+            if (!L->bv) L->bv = load_f32(g, BLK("attn_v.bias"), NULL);
             if (err) break;
             if (L->k_norm && L->q_norm && kn != qn) {
                 fprintf(stderr, "L%d: k_norm %d != q_norm %d\n", i, kn, qn);
@@ -4335,7 +4473,8 @@ static int model_load(model_t *m, gguf_t *g, int n_ctx) {
             }
         }
 
-        L->ffn_norm = must_f32(g, BLK("ffn_norm.weight"), NULL, &err);
+        // no ffn_norm when the FFN reads the attn_norm output (Phi-2)
+        L->ffn_norm = m->par_ffn ? NULL : must_f32(g, BLK("ffn_norm.weight"), NULL, &err);
         L->ffn_gate_inp = m->n_expert > 0 ? tensor_find(g, BLK("ffn_gate_inp.weight")) : NULL;
         if (L->ffn_gate_inp) {
             // MoE: experts are not copied — they stay as pointers into the mmap so the OS reads from disk
@@ -4360,11 +4499,23 @@ static int model_load(model_t *m, gguf_t *g, int n_ctx) {
             }
             L->ff_dim = m->ff_exp;
         } else {
-            L->ffn_gate = must_tensor(g, BLK("ffn_gate.weight"), &err);
+            L->ffn_gate = tensor_find(g, BLK("ffn_gate.weight"));
             L->ffn_up   = must_tensor(g, BLK("ffn_up.weight"), &err);
             L->ffn_down = must_tensor(g, BLK("ffn_down.weight"), &err);
             if (err) break;
-            L->ff_dim = (int)tensor_rows(L->ffn_gate);
+            int64_t ur = tensor_rows(L->ffn_up), dc = (int64_t)L->ffn_down->ne[0];
+            if (!L->ffn_gate && L->ffn_up->n_dims == 2 && ur == 2 * dc) {
+                // Phi-3: gate and up stacked in ffn_up (gate first), SwiGLU like the others
+                tensor_t *gu = L->ffn_up;
+                L->ffn_gate = split_rows(&L->split[3], gu, 0, dc, "gate");
+                L->ffn_up   = split_rows(&L->split[4], gu, dc, dc, "up");
+            } else if (!L->ffn_gate && !m->par_ffn) {   // only Phi-2 has an FFN without a gate
+                fprintf(stderr, "missing tensor: %s\n", BLK("ffn_gate.weight"));
+                return -1;
+            }
+            L->ff_dim = (int)tensor_rows(L->ffn_up);
+            L->ffn_up_b   = load_f32(g, BLK("ffn_up.bias"), NULL);     // Phi-2
+            L->ffn_down_b = load_f32(g, BLK("ffn_down.bias"), NULL);
         }
         L->ffn_post_norm = load_f32(g, BLK("post_ffw_norm.weight"), NULL);
         if (m->is_gemma && !L->ffn_post_norm) { fprintf(stderr, "missing tensor: %s\n", nm); return -1; }
@@ -4684,7 +4835,7 @@ static float *forward(model_t *m, int token, int pos) {
 
         // attn_norm
         memcpy(m->cur, m->x, n_embd * sizeof(float));
-        rmsnorm_w(m->cur, L->attn_norm, n_embd, m->norm_eps);
+        model_norm(m, m->cur, L->attn_norm, L->attn_norm_b, n_embd);
 
         // Q → (bias) → per-head norm if present → RoPE (Q, K and V computed together when this layer
         // owns its cache entries)
@@ -4699,7 +4850,7 @@ static float *forward(model_t *m, int token, int pos) {
         if (L->q_norm)
             for (int h = 0; h < L->n_head; h++)
                 rmsnorm_w(m->q + h * hd, L->q_norm, hd, m->norm_eps);
-        apply_rope(m->q, L->q_dim, pos, hd, n_rot, base, fscale, ff, m->rope_neox);
+        apply_rope(m->q, L->q_dim, pos, hd, n_rot, base, fscale, ff, m->rope_neox, m->rope_mscale);
 
         // K/V for owning layers
         if (own_kv) {
@@ -4715,7 +4866,7 @@ static float *forward(model_t *m, int token, int pos) {
                 if (L->k_norm) rmsnorm_w(m->k + h * hd, L->k_norm, hd, m->norm_eps);
                 if (m->v_norm) rmsnorm_plain(m->v + h * hd, hd, m->norm_eps);
             }
-            apply_rope(m->k, L->kv_dim, pos, hd, n_rot, base, fscale, ff, m->rope_neox);
+            apply_rope(m->k, L->kv_dim, pos, hd, n_rot, base, fscale, ff, m->rope_neox, m->rope_mscale);
 
             int slot = pos % m->cache_cap[il];
             if (m->kvq == 2) { // debug: the reference cache takes k/v before rotation
@@ -4858,14 +5009,26 @@ static float *forward(model_t *m, int token, int pos) {
 
         // output projection + post_attention_norm (if present) + residual
         if (matvec(L->wo, m->attn_out, m->ao) != 0) return NULL;
+        if (L->bo) for (int i = 0; i < n_embd; i++) m->ao[i] += L->bo[i];
         if (L->attn_post_norm) rmsnorm_w(m->ao, L->attn_post_norm, n_embd, m->norm_eps);
         for (int i = 0; i < n_embd; i++) m->ao[i] += m->x[i];
 
-        // FFN — GELU for Gemma, SiLU for the rest, or MoE experts
-        memcpy(m->f, m->ao, n_embd * sizeof(float));
-        rmsnorm_w(m->f, L->ffn_norm, n_embd, m->norm_eps);
+        // FFN — GELU for Gemma / Phi-2, SiLU for the rest, or MoE experts. Its input is the attention
+        // output after ffn_norm, or for Phi-2 the same attn_norm output the attention read
+        if (m->par_ffn) memcpy(m->f, m->cur, n_embd * sizeof(float));
+        else {
+            memcpy(m->f, m->ao, n_embd * sizeof(float));
+            model_norm(m, m->f, L->ffn_norm, NULL, n_embd);
+        }
         if (L->ffn_gate_inp) {
             if (moe_ffn(m, L, m->f, m->ffn_out) != 0) return NULL;
+        } else if (!L->ffn_gate) {   // plain FFN (Phi-2): down(act(up·x + b))
+            if (matvec(L->ffn_up, m->f, m->up) != 0) return NULL;
+            for (int i = 0; i < L->ff_dim; i++) {
+                float u = m->up[i] + (L->ffn_up_b ? L->ffn_up_b[i] : 0.0f);
+                m->gate[i] = m->act_gelu ? gelu_f(u) : silu_f(u);
+            }
+            if (matvec(L->ffn_down, m->gate, m->ffn_out) != 0) return NULL;
         } else {
             tensor_t *tf[2] = { L->ffn_gate, L->ffn_up };
             float *of[2] = { m->gate, m->up };
@@ -4876,6 +5039,7 @@ static float *forward(model_t *m, int token, int pos) {
                 for (int i = 0; i < L->ff_dim; i++) m->gate[i] = silu_f(m->gate[i]) * m->up[i];
             if (matvec(L->ffn_down, m->gate, m->ffn_out) != 0) return NULL;
         }
+        if (L->ffn_down_b) for (int i = 0; i < n_embd; i++) m->ffn_out[i] += L->ffn_down_b[i];
         if (L->ffn_post_norm) rmsnorm_w(m->ffn_out, L->ffn_post_norm, n_embd, m->norm_eps);
         for (int i = 0; i < n_embd; i++) m->ffn_out[i] += m->ao[i];
 
@@ -4895,9 +5059,10 @@ static float *forward(model_t *m, int token, int pos) {
         memcpy(m->x, m->ffn_out, n_embd * sizeof(float));
     }
 
-    // 4. final norm + LM head + softcap
-    rmsnorm_w(m->x, m->output_norm, n_embd, m->norm_eps);
+    // 4. final norm + LM head (+ bias) + softcap
+    model_norm(m, m->x, m->output_norm, m->output_norm_b, n_embd);
     if (matvec(m->output, m->x, m->logits) != 0) return NULL;
+    if (m->output_b) for (int i = 0; i < m->n_vocab; i++) m->logits[i] += m->output_b[i];
     if (m->final_softcap > 0.0f) {
         float cp = m->final_softcap;
         for (int i = 0; i < m->n_vocab; i++)
@@ -4961,7 +5126,7 @@ static int forward_chunk(model_t *m, const int *toks, int nb, int pos0, int want
         // attn_norm
         for (int b = 0; b < nb; b++) {
             memcpy(m->bcur + (size_t)b * E, X + (size_t)b * E, E * sizeof(float));
-            rmsnorm_w(m->bcur + (size_t)b * E, L->attn_norm, E, m->norm_eps);
+            model_norm(m, m->bcur + (size_t)b * E, L->attn_norm, L->attn_norm_b, E);
         }
 
         // Q → (bias) → per-head norm → RoPE
@@ -4972,7 +5137,7 @@ static int forward_chunk(model_t *m, const int *toks, int nb, int pos0, int want
             if (L->bq) for (int i = 0; i < L->q_dim; i++) q[i] += L->bq[i];
             if (L->q_norm)
                 for (int h = 0; h < L->n_head; h++) rmsnorm_w(q + h * hd, L->q_norm, hd, m->norm_eps);
-            apply_rope(q, L->q_dim, pos0 + b, hd, n_rot, base, fscale, ff, m->rope_neox);
+            apply_rope(q, L->q_dim, pos0 + b, hd, n_rot, base, fscale, ff, m->rope_neox, m->rope_mscale);
         }
 
         // K/V for owning layers, written into the cache for every token of the batch
@@ -4990,7 +5155,7 @@ static int forward_chunk(model_t *m, const int *toks, int nb, int pos0, int want
                     if (L->k_norm) rmsnorm_w(k + h * hd, L->k_norm, hd, m->norm_eps);
                     if (m->v_norm) rmsnorm_plain(v + h * hd, hd, m->norm_eps);
                 }
-                apply_rope(k, L->kv_dim, pos, hd, n_rot, base, fscale, ff, m->rope_neox);
+                apply_rope(k, L->kv_dim, pos, hd, n_rot, base, fscale, ff, m->rope_neox, m->rope_mscale);
                 int slot = pos % m->cache_cap[il];
                 if (m->kvq) {
                     for (int h = 0; h < L->n_head_kv; h++) {
@@ -5075,20 +5240,37 @@ static int forward_chunk(model_t *m, const int *toks, int nb, int pos0, int want
             }
         }
 
-        // output projection + post_attention_norm + residual
+        // output projection (+ bias) + post_attention_norm + residual; FFN input as in forward()
         if (matmul(L->wo, m->batt, LQ, m->bao, E, nb) != 0) return -1;
         for (int b = 0; b < nb; b++) {
             float *ao = m->bao + (size_t)b * E, *f = m->bf + (size_t)b * E;
+            if (L->bo) for (int i = 0; i < E; i++) ao[i] += L->bo[i];
             if (L->attn_post_norm) rmsnorm_w(ao, L->attn_post_norm, E, m->norm_eps);
             for (int i = 0; i < E; i++) ao[i] += X[(size_t)b * E + i];
-            memcpy(f, ao, E * sizeof(float));
-            rmsnorm_w(f, L->ffn_norm, E, m->norm_eps);
+            if (m->par_ffn) memcpy(f, m->bcur + (size_t)b * E, E * sizeof(float));
+            else {
+                memcpy(f, ao, E * sizeof(float));
+                model_norm(m, f, L->ffn_norm, NULL, E);
+            }
         }
 
-        // FFN — GELU for Gemma, SiLU for the rest; MoE experts token by token
+        // FFN — GELU for Gemma / Phi-2, SiLU for the rest; MoE experts token by token
         if (L->ffn_gate_inp) {
             for (int b = 0; b < nb; b++)
                 if (moe_ffn(m, L, m->bf + (size_t)b * E, m->bffn + (size_t)b * E) != 0) return -1;
+        } else if (!L->ffn_gate) {   // plain FFN (Phi-2)
+            if (matmul(L->ffn_up, m->bf, E, m->bup, LF, nb) != 0) return -1;
+            int fd = L->ff_dim, gelu = m->act_gelu;
+            const float *ub = L->ffn_up_b;
+            #pragma omp parallel for schedule(static)
+            for (int b = 0; b < nb; b++) {
+                float *g = m->bgate + (size_t)b * LF, *u = m->bup + (size_t)b * LF;
+                for (int i = 0; i < fd; i++) {
+                    float x = u[i] + (ub ? ub[i] : 0.0f);
+                    g[i] = gelu ? gelu_f(x) : silu_f(x);
+                }
+            }
+            if (matmul(L->ffn_down, m->bgate, LF, m->bffn, E, nb) != 0) return -1;
         } else {
             if (matmul(L->ffn_gate, m->bf, E, m->bgate, LF, nb) != 0) return -1;
             if (matmul(L->ffn_up, m->bf, E, m->bup, LF, nb) != 0) return -1;
@@ -5103,6 +5285,7 @@ static int forward_chunk(model_t *m, const int *toks, int nb, int pos0, int want
         }
         for (int b = 0; b < nb; b++) {
             float *fo = m->bffn + (size_t)b * E, *ao = m->bao + (size_t)b * E;
+            if (L->ffn_down_b) for (int i = 0; i < E; i++) fo[i] += L->ffn_down_b[i];
             if (L->ffn_post_norm) rmsnorm_w(fo, L->ffn_post_norm, E, m->norm_eps);
             for (int i = 0; i < E; i++) fo[i] += ao[i];
             if (L->out_scale != 1.0f) for (int i = 0; i < E; i++) fo[i] *= L->out_scale;
@@ -5111,10 +5294,11 @@ static int forward_chunk(model_t *m, const int *toks, int nb, int pos0, int want
     }
 
     if (!want_logits) return 0;
-    // final norm + LM head + softcap — only the last token's logits are needed
+    // final norm + LM head (+ bias) + softcap — only the last token's logits are needed
     memcpy(m->x, X + (size_t)(nb - 1) * E, E * sizeof(float));
-    rmsnorm_w(m->x, m->output_norm, E, m->norm_eps);
+    model_norm(m, m->x, m->output_norm, m->output_norm_b, E);
     if (matvec(m->output, m->x, m->logits) != 0) return -1;
+    if (m->output_b) for (int i = 0; i < m->n_vocab; i++) m->logits[i] += m->output_b[i];
     if (m->final_softcap > 0.0f) {
         float cp = m->final_softcap;
         for (int i = 0; i < m->n_vocab; i++) m->logits[i] = cp * tanhf(m->logits[i] / cp);
@@ -5922,9 +6106,9 @@ static int cmd_selftest(void) {
     {
         float a[512], b[512], c[512];
         for (int i = 0; i < 512; i++) a[i] = b[i] = c[i] = (float)(rand() % 2000 - 1000) / 500.0f;
-        apply_rope(a, 512, 1234, 256, 256, 1e6, 0.5, NULL, 1);
-        apply_rope(b, 512, 617, 256, 256, 1e6, 1.0, NULL, 1);
-        apply_rope(c, 512, 1234, 256, 256, 1e6, 1.0, NULL, 1);
+        apply_rope(a, 512, 1234, 256, 256, 1e6, 0.5, NULL, 1, 1.0f);
+        apply_rope(b, 512, 617, 256, 256, 1e6, 1.0, NULL, 1, 1.0f);
+        apply_rope(c, 512, 1234, 256, 256, 1e6, 1.0, NULL, 1, 1.0f);
         float same = 0.0f, diff = 0.0f;
         for (int i = 0; i < 512; i++) {
             same = fmaxf(same, fabsf(a[i] - b[i]));

@@ -35,13 +35,15 @@ jobs:
       - name: Batched prompt gives the same reply as token-by-token
         run: |
           P=$(python3 -c "print('The quick brown fox jumps over the lazy dog. ' * 8)")
-          for q in q8_0 q4_k_m q4_0; do
-            python tools/synth_gguf.py tiny-test $q t.gguf
-            for cpu in auto avx2; do
-              a=$(printf '%s\n' "$P" | FASTGGUF_CPU=$cpu ./fastgguf chat t.gguf 1024 --temp 0 --max-tokens 24 2>/dev/null | grep -a '^llama>')
-              b=$(printf '%s\n' "$P" | FASTGGUF_CPU=$cpu FASTGGUF_BATCH=0 ./fastgguf chat t.gguf 1024 --temp 0 --max-tokens 24 2>/dev/null | grep -a '^llama>')
-              echo "$q ($cpu): $a"
-              [ -n "$a" ] && [ "$a" = "$b" ]
+          for m in tiny-test tiny-phi2 tiny-phi3; do
+            for q in q8_0 q4_k_m q4_0; do
+              python tools/synth_gguf.py $m $q t.gguf
+              for cpu in auto avx2; do
+                a=$(printf '%s\n' "$P" | FASTGGUF_CPU=$cpu ./fastgguf chat t.gguf 1024 --temp 0 --max-tokens 24 2>/dev/null | grep -a '^[a-z0-9]*>')
+                b=$(printf '%s\n' "$P" | FASTGGUF_CPU=$cpu FASTGGUF_BATCH=0 ./fastgguf chat t.gguf 1024 --temp 0 --max-tokens 24 2>/dev/null | grep -a '^[a-z0-9]*>')
+                echo "$m $q ($cpu): $a"
+                [ -n "$a" ] && [ "$a" = "$b" ]
+              done
             done
           done
       - uses: actions/upload-artifact@v4

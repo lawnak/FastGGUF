@@ -84,8 +84,8 @@ Download any `.gguf` file of a [supported model](#supported-models) from
 | Your RAM | Try | File size |
 |---|---|---|
 | 4 GB | Qwen2.5 1.5B Instruct, Q4_K_M | ~1.0 GB |
-| 8 GB | Llama 3.2 3B Instruct or Qwen3 4B, Q4_K_M | 2–2.5 GB |
-| 16 GB | Llama 3.1 8B / Qwen3 8B / Mistral 7B Instruct, Q4_K_M | 4.5–5 GB |
+| 8 GB | Llama 3.2 3B Instruct, Qwen3 4B or Phi-4-mini Instruct, Q4_K_M | 2–2.5 GB |
+| 16 GB | Llama 3.1 8B / Qwen3 8B / Mistral 7B Instruct, Q4_K_M (or Phi-4 14B, ~9 GB) | 4.5–5 GB |
 | 32 GB+ | Qwen3 30B-A3B (MoE), Q4_K_M | ~18 GB |
 
 The file should be at most about 2/3 of your RAM (or of your VRAM if you want it fully on the GPU).
@@ -149,9 +149,11 @@ fastgguf reads the architecture name stored inside the GGUF file
 | `qwen3moe` | Qwen3 MoE (30B-A3B, 235B-A22B) | Experts streamed from disk. |
 | `gemma3` | Gemma 3 (1B – 27B) text | Sliding-window attention, RoPE scaling. |
 | `gemma4` | Gemma 4 | Per-layer embeddings, shared KV layers. |
+| `phi3` | Phi-3 / Phi-3.5 mini and medium, Phi-4 (14B), Phi-4-mini | Fused QKV and gate/up weights, LongRoPE for the 128k models, partial rotary (Phi-4-mini). Phi-3 template, or Phi-4's `<\|im_sep\|>` ChatML. |
+| `phi2` | Phi-2, Phi-1.5 | LayerNorm, attention and FFN in parallel. No chat template: prompts use the model card's `Instruct: … Output:` format. |
 
 Anything else prints a warning and is tried with the Llama code path — it may work for
-close relatives, but usually will not. Supported chat templates: Llama 3, ChatML (Qwen), Mistral/Llama 2 `[INST]`, Gemma, Gemma 4 — models trained on another template (for example the DeepSeek-R1 distills) run, but answer worse. **Not supported:** Phi, Gemma 1/2, DeepSeek V2/V3,
+close relatives, but usually will not. Supported chat templates: Llama 3, ChatML (Qwen), Mistral/Llama 2 `[INST]`, Gemma, Gemma 4, Phi-3, Phi-4 — models trained on another template (for example the DeepSeek-R1 distills) run, but answer worse. **Not supported:** Phi-3.5-MoE (`phimoe`), Gemma 1/2, DeepSeek V2/V3,
 Qwen2 MoE (shared experts), GPT-OSS, vision/multimodal projectors, embedding models.
 
 ### Weight (quantization) types

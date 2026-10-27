@@ -28,7 +28,25 @@ PRESETS = {
     "qwen3-4b":       ("qwen3",  2560,  36,   32,   8,  128,     9728, 151936, True,  False),
     "gemma-3-1b":     ("gemma3", 1152,  26,    4,   1,  256,     6912, 262144, True,  False),
     "gemma-3-4b":     ("gemma3", 2560,  34,    8,   4,  256,    10240, 262144, True,  False),
+    "phi-2":          ("phi2",   2560,  32,   32,  32,   80,    10240,  51200, False, True),
+    "phi-3-mini":     ("phi3",   3072,  32,   32,  32,   96,     8192,  32064, False, False),
+    "phi-3.5-mini":   ("phi3",   3072,  32,   32,  32,   96,     8192,  32064, False, False),
+    "phi-4-mini":     ("phi3",   3072,  32,   24,   8,  128,     8192, 200064, True,  False),
+    "phi-4":          ("phi3",   5120,  40,   40,  10,  128,    17920, 100352, False, False),
     "tiny-test":      ("llama",   256,   2,    4,   2,   64,      512,   1024, True,  False),
+    "tiny-phi2":      ("phi2",    256,   2,    4,   4,   64,     1024,   1024, False, True),
+    "tiny-phi3":      ("phi3",    256,   2,    4,   2,   64,      512,   1024, True,  False),
+}
+
+# Phi extras: rotary dims (partial rotation), LongRoPE (original context), tokenizer kind
+PHI = {
+    "phi-2":        dict(rot=32),
+    "phi-3-mini":   dict(rot=96, tok="spm"),
+    "phi-3.5-mini": dict(rot=96, tok="spm", longrope=4096),
+    "phi-4-mini":   dict(rot=96, tok="phi4mini", longrope=4096),
+    "phi-4":        dict(rot=128, tok="phi4"),
+    "tiny-phi2":    dict(rot=32),
+    "tiny-phi3":    dict(rot=32, tok="spm", longrope=256),
 }
 
 # bytes per block, elements per block, byte offsets of fp16 scale fields
@@ -86,14 +104,24 @@ def f32(n, val=None):
     return (rng.standard_normal(n) * 0.02).astype(np.float32)
 
 
-def vocab(arch, n):
+def vocab(arch, n, tok=None):
     """A vocab that the engine can tokenize: specials + byte tokens + filler."""
-    if arch.startswith("gemma"):
-        specials = ["<pad>", "<eos>", "<bos>", "<unk>", "<start_of_turn>", "<end_of_turn>"]
+    if arch.startswith("gemma") or tok == "spm":
+        if tok == "spm":  # Phi-3: Llama SentencePiece vocab with the chat tokens
+            specials = ["<unk>", "<s>", "</s>", "<|endoftext|>", "<|assistant|>", "<|system|>",
+                        "<|end|>", "<|user|>"]
+        else:
+            specials = ["<pad>", "<eos>", "<bos>", "<unk>", "<start_of_turn>", "<end_of_turn>"]
         toks = specials + [f"<0x{b:02X}>" for b in range(256)] + ["▁"]
         model = "llama"
     else:
-        if arch == "llama":
+        if tok == "phi4":
+            specials = ["<|endoftext|>", "<|im_start|>", "<|im_sep|>", "<|im_end|>"]
+        elif tok == "phi4mini":
+            specials = ["<|endoftext|>", "<|assistant|>", "<|system|>", "<|end|>", "<|user|>"]
+        elif arch == "phi2":  # CodeGen vocab: <|endoftext|> is the only special token
+            specials = ["<|endoftext|>"]
+        elif arch == "llama":
             specials = ["<|begin_of_text|>", "<|end_of_text|>", "<|start_header_id|>",
                         "<|end_header_id|>", "<|eot_id|>"]
         else:
@@ -126,6 +154,7 @@ def main():
     arch, embd, nl, nh, nkv, hd, ff, nv, tied, bias = PRESETS[a.preset]
     main_t, hi_t = RECIPES[a.quant]
     gemma = arch.startswith("gemma")
+    phi = PHI.get(a.preset)
     w = GGUFWriter(a.out, arch)
     w.add_name(f"synthetic-{a.preset}-{a.quant}")
     w.add_block_count(nl)
@@ -136,14 +165,24 @@ def main():
     w.add_head_count_kv(nkv)
     w.add_key_length(hd)
     w.add_value_length(hd)
-    w.add_layer_norm_rms_eps(1e-6)
-    w.add_rope_freq_base(1e6 if gemma or arch.startswith("qwen") else 500000.0)
+    if arch == "phi2":
+        w.add_layer_norm_eps(1e-5)
+    else:
+        w.add_layer_norm_rms_eps(1e-6)
+    w.add_rope_freq_base(1e6 if gemma or arch.startswith("qwen") else 10000.0 if phi else 500000.0)
+    if phi:
+        w.add_rope_dimension_count(phi["rot"])
+    if phi and phi.get("longrope"):
+        orig = phi["longrope"]
+        ctx = 32768
+        w.add_rope_scaling_orig_ctx_len(orig)
+        w.add_rope_scaling_attn_factors(float(np.sqrt(1 + np.log(ctx / orig) / np.log(orig))))
     if gemma:
         w.add_sliding_window(512)
         if embd > 2000:  # Gemma 3 4B and up use linear RoPE scaling on global layers
             w.add_float32(f"{arch}.rope.scaling.factor", 8.0)
 
-    model, toks, types, specials = vocab(arch, nv)
+    model, toks, types, specials = vocab(arch, nv, phi.get("tok") if phi else None)
     w.add_tokenizer_model(model)
     w.add_token_list(toks)
     w.add_token_types(types)
@@ -154,8 +193,12 @@ def main():
         w.add_token_scores([0.0] * len(toks))
     if gemma:
         w.add_bos_token_id(2); w.add_eos_token_id(1)
+    elif phi and phi.get("tok") == "spm":
+        w.add_bos_token_id(1); w.add_eos_token_id(3); w.add_add_bos_token(False)
     elif arch == "llama":
         w.add_bos_token_id(0); w.add_eos_token_id(4)
+    elif arch == "phi2" or (phi and phi.get("tok") in ("phi4", "phi4mini")):
+        w.add_eos_token_id(0)
     else:
         w.add_eos_token_id(2)
 
@@ -164,11 +207,36 @@ def main():
     if not tied:
         add_q(w, "output.weight", nv, embd, hi_t)
     w.add_tensor("output_norm.weight", f32(embd, 1.0))
+    if arch == "phi2":
+        w.add_tensor("output_norm.bias", f32(embd))
+        w.add_tensor("output.bias", f32(nv))
+    if phi and phi.get("longrope"):
+        half = phi["rot"] // 2
+        w.add_tensor("rope_factors_long.weight", np.linspace(1.0, 40.0, half, dtype=np.float32))
+        w.add_tensor("rope_factors_short.weight", np.linspace(1.0, 1.5, half, dtype=np.float32))
 
     q_dim, kv_dim = nh * hd, nkv * hd
     for i in range(nl):
         p = f"blk.{i}."
         w.add_tensor(p + "attn_norm.weight", f32(embd, 1.0))
+        if phi:  # Phi: Q, K and V in one matrix (and for Phi-3, gate and up in ffn_up)
+            if arch == "phi2":
+                w.add_tensor(p + "attn_norm.bias", f32(embd))
+            add_q(w, p + "attn_qkv.weight", q_dim + 2 * kv_dim, embd, main_t)
+            add_q(w, p + "attn_output.weight", embd, q_dim, main_t)
+            dt = hi_t if i % 2 == 0 else main_t
+            if arch == "phi2":
+                w.add_tensor(p + "attn_qkv.bias", f32(q_dim + 2 * kv_dim))
+                w.add_tensor(p + "attn_output.bias", f32(embd))
+                add_q(w, p + "ffn_up.weight", ff, embd, main_t)
+                w.add_tensor(p + "ffn_up.bias", f32(ff))
+                add_q(w, p + "ffn_down.weight", embd, ff, dt)
+                w.add_tensor(p + "ffn_down.bias", f32(embd))
+            else:
+                w.add_tensor(p + "ffn_norm.weight", f32(embd, 1.0))
+                add_q(w, p + "ffn_up.weight", 2 * ff, embd, main_t)
+                add_q(w, p + "ffn_down.weight", embd, ff, dt)
+            continue
         add_q(w, p + "attn_q.weight", q_dim, embd, main_t)
         add_q(w, p + "attn_k.weight", kv_dim, embd, main_t)
         vt = hi_t if i % 2 == 0 else main_t
