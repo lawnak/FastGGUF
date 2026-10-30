@@ -1,0 +1,20 @@
+[package]
+name = "fastgguf"
+version = "0.1.0"
+edition = "2021"
+description = "Run GGUF language models on the CPU - Rust port of fastgguf.c"
+license = "MIT"
+
+[[bin]]
+name = "fastgguf"
+path = "src/main.rs"
+
+[dependencies]
+memmap2 = "0.9"
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
