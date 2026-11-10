@@ -47,6 +47,7 @@ NVIDIA, AMD or Intel graphics card through OpenCL when one is present.
 | **Mixture-of-Experts** | Qwen3 MoE models. Experts are read from disk only when the router picks them, so a model larger than your RAM can still run. |
 | **TurboQuant KV cache** | Optional compressed attention cache (`FASTGGUF_KV=turbo`): 5–9× less memory for long conversations, with a Hadamard rotation that keeps accuracy. |
 | **Batched prompt reading** | The message is processed in batches of up to 64 tokens with an int8 matrix-multiply (VNNI where available) and tiled attention, 8–9× faster than token by token; results agree with token-by-token up to float rounding. |
+| **Speculative decoding** | Guesses the next tokens from the conversation itself (prompt lookup, no second model) and checks several at once: up to 2× faster when the reply repeats text it has seen (rewriting, quoting, code, JSON), about the same speed otherwise. With greedy sampling the text is exactly the same as without it. |
 | **Prompt cache reuse** | The server keeps the previous conversation in the KV cache and only processes the new part of each request. |
 | **Sampling controls** | temperature, top-k, top-p, repeat penalty, seed (reproducible replies), greedy mode. |
 | **Unicode everywhere** | Arabic, CJK and emoji are printed correctly, including on the Windows console and in file paths. |
@@ -266,6 +267,14 @@ back to back, in one run. llama.cpp's results for the smallest models varied mos
 **What changed recently** (each change measured against the version before it on the same VM, at the
 same time)
 
+- **v0.11.0 — speculative decoding** (prompt lookup): drafts the next tokens from earlier text and checks
+  them in one batch. Real models, greedy, 7 kinds of prompt: 1.08–1.18× overall, up to 2.0× (Qwen2.5 0.5B
+  rewriting a paragraph: 115 → 231 tok/s); see [Speculative decoding](#speculative-decoding). On by default,
+  `FASTGGUF_SPEC=0` turns it off.
+- **v0.11.0 — small batches read the weights once:** 2–16 tokens through the Q4_K / Q4_0 generation kernels
+  multiply each loaded weight group with up to 4 tokens (before, batches under 8 went token by token), and
+  Q6_K / Q8_0 / Q5_0 rows are unpacked once for 2 or 3 tokens too. Checking 4 tokens costs ~1.5× one token
+  instead of ~2.6×. The results are bit-for-bit those of the single-token kernels (the self-test checks it).
 - **v0.10.0 — Q4_0 weights re-arranged at load time** like Q4_K (8 rows side by side, same size as the
   file): generation +42–50 % for Q4_0 files (Llama 3.2 1B 40.9 → 58.2 tok/s, Qwen2.5 0.5B 108 → 163).
   The prompt GEMM rebuilds rows from the new layout with one vector load, so prompt speed is unchanged.
@@ -334,6 +343,38 @@ very long contexts into little RAM. Qwen models automatically keep 8-bit keys, s
 attention scores are too large for 4 bits. Requires a power-of-two head size (true for
 almost all models; otherwise the normal cache is used).
 
+### Speculative decoding
+
+Generating a token reads the whole model; checking several tokens in one batch reads it once too. So if
+the next tokens can be guessed, each right guess is almost free. fastgguf guesses from the conversation
+itself (*prompt lookup*): when the last 2–4 tokens appeared earlier, the tokens that followed them are
+proposed. The model checks each guess with the normal sampler, in order, and keeps it only if it is the
+token the sampler picks, so replies follow the same distribution as without speculation; with greedy
+sampling (`--temp 0`) the text is identical, because the checks use kernels that give bit-for-bit the
+single-token results. The number of guesses per step adapts to how often they are accepted and to the
+measured cost of a check; when guessing does not pay, generation runs one token at a time as before.
+
+Measured on the 4-vCPU VM above with real models (greedy, 256 tokens, speculation off / on):
+
+| Prompt | Qwen2.5 0.5B Q4_0 | Llama 3.2 1B Q4_K_M | Qwen2.5 1.5B Q4_K_M |
+|---|---|---|---|
+| Story | 113 / 129 | 52 / 51 | 40 / 39 |
+| Explain a concept | 116 / 126 | 52 / 52 | 40 / 42 |
+| Write a Python class | 115 / 122 | 52 / 57 | 40 / 48 |
+| Rewrite a paragraph in simpler English | 115 / **231** | 51 / 56 | 40 / 52 |
+| List the years in a paragraph | 116 / 149 | 50 / 63 | 41 / 46 |
+| Add type hints to given code | 115 / 116 | 51 / 52 | 40 / 44 |
+| Convert a list to JSON | 113 / 148 | 51 / 64 | 40 / 54 |
+| **All together** | **1.18×** | **1.08×** | **1.13×** |
+
+Tokens per second. It helps most where the reply reuses text it has seen (editing, summarizing a pasted
+document, code changes, structured output) and little for free writing. It is off on the GPU (one token at
+a time there), for MoE models (each token reads its own experts) and for Gemma 4 (per-layer embeddings).
+`FASTGGUF_SPEC=N` sets the most tokens guessed per step (default 8), `FASTGGUF_SPEC=0` turns it off.
+The chat prints how many guesses were accepted after each reply. To measure your own model and machine:
+`python tools/spec_bench.py model.gguf` (needs a real model; random-weight synthetic models repeat
+themselves, which would flatter prompt lookup, so `tools/bench.py` turns speculation off unless `--spec`).
+
 ### Tips for more speed
 
 1. Use a discrete GPU if you have one (it is used automatically).
@@ -342,6 +383,8 @@ almost all models; otherwise the normal cache is used).
    (`-march=native`) can be a little faster still.
 4. On laptops, plug in the charger (fastgguf already opts out of Windows 11 power throttling).
 5. Close memory-heavy programs; the model must fit in RAM to avoid disk reads.
+6. For editing, rewriting or summarizing text you paste in, greedy sampling (`--temp 0`, or
+   `"temperature": 0` in the API) lets speculative decoding accept the most guesses.
 
 ---
 
@@ -407,6 +450,7 @@ system message and the latest message are always kept).
 | `FASTGGUF_KV` | `turbo`, `turbo8`, `turbo4`, `turbo2` | compressed KV cache (see above) |
 | `FASTGGUF_API_KEY` | any text | server requires `Authorization: Bearer <key>` |
 | `OMP_NUM_THREADS` | number | CPU threads (default: all) |
+| `FASTGGUF_SPEC` | `0`, `1`…`8` | speculative decoding: most tokens guessed per step (default 8); `0` = off |
 | `FASTGGUF_BATCH` | `0` | read prompts token by token instead of in batches (same results up to float rounding, much slower; for troubleshooting) |
 | `FASTGGUF_CPU` | `avx512`, `avxvnni`, `avx2`, `sse2` | release downloads only: force one of the built-in kernel sets (default: the fastest your CPU supports) |
 | `FASTGGUF_REPACK` | `0` | do not re-arrange Q4_K / Q4_0 weights at load time (less RAM, faster start, slower generation) |
@@ -470,5 +514,6 @@ chat.bat, server.bat    Windows drag-and-drop launchers
 run.sh                  Linux/macOS launcher
 tools/synth_gguf.py     synthetic GGUF models for benchmarks and tests
 tools/bench.py          speed benchmark
+tools/spec_bench.py     speculative decoding benchmark (real models)
 docs/images/            pictures used in this README
 ```
