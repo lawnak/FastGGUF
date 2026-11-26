@@ -1334,16 +1334,20 @@ static void dot_q4_K_q8k_x4(const uint8_t *row, const q8k_blk_t *const y[4], int
 #endif
 }
 
-static void dot_q6_K_q8k_x4(const uint8_t *row, const q8k_blk_t *const y[4], int nb, float out[4]) {
+// NT ≤ 4 inputs (a constant after inlining); dot_q6_K_q8k_x4 / _xn below
+static inline __attribute__((always_inline))
+void dot_q6_K_q8k_nt(const int NT, const uint8_t *row, const q8k_blk_t *const *y, int nb, float *out) {
 #if defined(__AVX2__)
     const __m256i m4 = _mm256_set1_epi8(0x0F), m3 = _mm256_set1_epi8(3);
-    __m256 acc[4] = { _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps() };
-    __m128 cac[4] = { _mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps() };
+    __m256 acc[4];
+    __m128 cac[4];
+    for (int t = 0; t < NT; t++) { acc[t] = _mm256_setzero_ps(); cac[t] = _mm_setzero_ps(); }
     for (int b = 0; b < nb; b++) {
         const uint8_t *p = row + b * 210;
         const int8_t *sc = (const int8_t *)(p + 192);
         float d = FP16(rd_u16(p + 208));
-        __m256i s0 = _mm256_setzero_si256(), s1 = s0, s2 = s0, s3 = s0;
+        __m256i ss[4];
+        for (int t = 0; t < NT; t++) ss[t] = _mm256_setzero_si256();
         for (int half = 0; half < 2; half++) {
             const uint8_t *ql = p + half * 64, *qh = p + 128 + half * 32;
             const int8_t *s = sc + half * 8;
@@ -1362,24 +1366,30 @@ static void dot_q6_K_q8k_x4(const uint8_t *row, const q8k_blk_t *const y[4], int
             for (int k = 0; k < 4; k++) {
                 __m256i sv = _mm256_insertf128_si256(_mm256_castsi128_si256(_mm_set1_epi16(s[2 * k])),
                                                      _mm_set1_epi16(s[2 * k + 1]), 1);
-#define Q6K_T(t, acc_i) acc_i = _mm256_add_epi32(acc_i, _mm256_madd_epi16(_mm256_maddubs_epi16(q[k], \
-                _mm256_loadu_si256((const __m256i *)(y[t][b].qs + half * 128 + 32 * k))), sv));
-                Q6K_T(0, s0) Q6K_T(1, s1) Q6K_T(2, s2) Q6K_T(3, s3)
-#undef Q6K_T
+                for (int t = 0; t < NT; t++)
+                    ss[t] = _mm256_add_epi32(ss[t], _mm256_madd_epi16(_mm256_maddubs_epi16(q[k],
+                                _mm256_loadu_si256((const __m256i *)(y[t][b].qs + half * 128 + 32 * k))), sv));
             }
         }
-        __m256i ss[4] = { s0, s1, s2, s3 };
         __m256i sc16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)sc));
-        for (int t = 0; t < 4; t++) {
+        for (int t = 0; t < NT; t++) {
             float dd = d * y[t][b].d;
             acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(dd), _mm256_cvtepi32_ps(ss[t]), acc[t]);
             cac[t] = _mm_fmadd_ps(_mm_set1_ps(dd * 32.0f), _mm_cvtepi32_ps(q6_corr_vec(sc16, &y[t][b])), cac[t]);
         }
     }
-    for (int t = 0; t < 4; t++) out[t] = hsum_ps(acc[t]) - hsum128_ps(cac[t]);
+    for (int t = 0; t < NT; t++) out[t] = hsum_ps(acc[t]) - hsum128_ps(cac[t]);
 #else
-    for (int t = 0; t < 4; t++) out[t] = dot_q6_K_q8k(row, y[t], nb);
+    for (int t = 0; t < NT; t++) out[t] = dot_q6_K_q8k(row, y[t], nb);
 #endif
+}
+static void dot_q6_K_q8k_x4(const uint8_t *row, const q8k_blk_t *const y[4], int nb, float out[4]) {
+    dot_q6_K_q8k_nt(4, row, y, nb, out);
+}
+// 2 or 3 inputs (the rest of a batch after groups of 4)
+static void dot_q6_K_q8k_xn(int nt, const uint8_t *row, const q8k_blk_t *const *y, int nb, float *out) {
+    if (nt == 2) dot_q6_K_q8k_nt(2, row, y, nb, out);
+    else         dot_q6_K_q8k_nt(3, row, y, nb, out);
 }
 
 #if defined(__AVX2__)
@@ -1397,11 +1407,13 @@ static inline __m256i mul_sum_i8_pre(__m256i a, __m256i ax, __m256i b) {
 #endif
 
 // 32-element block types (Q8_0 / Q4_0 / Q5_0): bytes per block and how to get the int8 values
-static void dot_q32_q8_x4(uint32_t type, const uint8_t *row, const q8_blk_t *const y[4], int nb, float out[4]) {
+static inline __attribute__((always_inline))
+void dot_q32_q8_nt(const int NT, uint32_t type, const uint8_t *row, const q8_blk_t *const *y, int nb, float *out) {
 #if defined(__AVX2__)
     int bb = type == T_Q8_0 ? 34 : type == T_Q4_0 ? 18 : 22;
     const __m256i f0 = _mm256_set1_epi8((char)0xF0), off8 = _mm256_set1_epi8(8);
-    __m256 acc[4] = { _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps() };
+    __m256 acc[4];
+    for (int t = 0; t < NT; t++) acc[t] = _mm256_setzero_ps();
     for (int b = 0; b < nb; b++) {
         const uint8_t *p = row + b * bb;
         __m256i bx;
@@ -1410,17 +1422,24 @@ static void dot_q32_q8_x4(uint32_t type, const uint8_t *row, const q8_blk_t *con
         else bx = _mm256_or_si256(nibbles32(p + 6), _mm256_andnot_si256(bytes_from_bits_32(p + 2), f0));
         __m256i ax = _mm256_sign_epi8(bx, bx);
         float d = FP16(rd_u16(p));
-        for (int t = 0; t < 4; t++) {
+        for (int t = 0; t < NT; t++) {
             __m256i s = mul_sum_i8_pre(bx, ax, _mm256_loadu_si256((const __m256i *)y[t][b].qs));
             acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * y[t][b].d), _mm256_cvtepi32_ps(s), acc[t]);
         }
     }
-    for (int t = 0; t < 4; t++) out[t] = hsum_ps(acc[t]);
+    for (int t = 0; t < NT; t++) out[t] = hsum_ps(acc[t]);
 #else
-    for (int t = 0; t < 4; t++)
+    for (int t = 0; t < NT; t++)
         out[t] = type == T_Q8_0 ? dot_q8_0_q8(row, y[t], nb)
                : type == T_Q4_0 ? dot_q4_0_q8(row, y[t], nb) : dot_q5_0_q8(row, y[t], nb);
 #endif
+}
+static void dot_q32_q8_x4(uint32_t type, const uint8_t *row, const q8_blk_t *const y[4], int nb, float out[4]) {
+    dot_q32_q8_nt(4, type, row, y, nb, out);
+}
+static void dot_q32_q8_xn(int nt, uint32_t type, const uint8_t *row, const q8_blk_t *const *y, int nb, float *out) {
+    if (nt == 2) dot_q32_q8_nt(2, type, row, y, nb, out);
+    else         dot_q32_q8_nt(3, type, row, y, nb, out);
 }
 
 // dot(Q2_K row, Q8-quantized x) — value d*(s&0xF)*q - dmin*(s>>4) per 16 elements:
@@ -2572,6 +2591,200 @@ static int matvec_multi(int n, tensor_t *const *t, const float *x, float *const 
     return 0;
 }
 
+// -------------------------------------------------------------------------
+// Small batches (2..RP_SMALL tokens) on repacked weights — speculative decoding checks a few drafted
+// tokens at once. The prompt GEMM is built for 64 tokens and unpacks every row first; for a handful
+// of tokens that costs more than it saves. Here each 32-byte load of an 8-row group is multiplied with
+// up to RP_NT tokens while it is in registers, so the weights are read from memory once per batch.
+// The integer sums and the float steps per block are those of dot_q40x8 / dot_q4Kx8, so every token
+// gets bit-for-bit the result the single-token kernel would give.
+// -------------------------------------------------------------------------
+#ifndef RP_SMALL
+#define RP_SMALL 16                  // batches up to this size take this path (above: the GEMM)
+#endif
+#if defined(__AVX512VL__)
+#define RP_NT 4                      // tokens per pass over a group: 32 vector registers
+#else
+#define RP_NT 2                      // 16 registers on AVX2
+#endif
+
+#if defined(__AVX2__)
+// o8[t][b] = 8·Σy of block b of token t (the -8 offset), computed once per batch, not per group
+static inline __attribute__((always_inline))
+void dot_q40x8_nt(const int NT, const q40x8_t *B, const q8_blk_t *const *y, const int32_t *const *o8,
+                  int nb, float *out) {
+    const __m256i m4 = _mm256_set1_epi8(0x0F);
+    __m256 acc[RP_NT];
+    for (int t = 0; t < NT; t++) acc[t] = _mm256_setzero_ps();
+    for (int b = 0; b < nb; b++, B++) {
+        __builtin_prefetch((const uint8_t *)B + PF_DIST, 0, 3);
+        __builtin_prefetch((const uint8_t *)B + PF_DIST + 64, 0, 3);
+        __builtin_prefetch((const uint8_t *)B + PF_DIST + 128, 0, 3);
+        __m256i lo[4], hi[4];
+        for (int s = 0; s < 4; s++) {
+            __m256i v = _mm256_loadu_si256((const __m256i *)B->qs[s]);
+            lo[s] = _mm256_and_si256(v, m4);
+            hi[s] = _mm256_and_si256(_mm256_srli_epi16(v, 4), m4);
+        }
+#if defined(__F16C__)
+        __m256 d = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)B->d));
+#else
+        float df[8];
+        for (int r = 0; r < 8; r++) df[r] = FP16(B->d[r]);
+        __m256 d = _mm256_loadu_ps(df);
+#endif
+        for (int t = 0; t < NT; t++) {      // two chains per token; the tokens interleave
+            const q8_blk_t *yb = y[t] + b;
+            const int32_t *a = (const int32_t *)yb->qs;
+            __m256i i0 = _mm256_sub_epi32(_mm256_setzero_si256(), _mm256_set1_epi32(o8[t][b]));
+            __m256i i1 = _mm256_setzero_si256();
+            for (int s = 0; s < 4; s++) {
+                i0 = dp_u8s8_x8(i0, lo[s], _mm256_set1_epi32(a[s]));
+                i1 = dp_u8s8_x8(i1, hi[s], _mm256_set1_epi32(a[4 + s]));
+            }
+            acc[t] = _mm256_fmadd_ps(_mm256_mul_ps(d, _mm256_set1_ps(yb->d)),
+                                     _mm256_cvtepi32_ps(_mm256_add_epi32(i0, i1)), acc[t]);
+        }
+    }
+    for (int t = 0; t < NT; t++) _mm256_storeu_ps(out + 8 * t, acc[t]);
+}
+
+static inline __attribute__((always_inline))
+void dot_q4Kx8_nt(const int NT, const q4kx8_t *B, const q8k_blk_t *const *y, const int32_t *const *bsp,
+                  int nb, float *out) {
+    const __m256i m4 = _mm256_set1_epi8(0x0F);
+    __m256 acc[RP_NT], macc[RP_NT];
+    for (int t = 0; t < NT; t++) { acc[t] = _mm256_setzero_ps(); macc[t] = _mm256_setzero_ps(); }
+    for (int b = 0; b < nb; b++, B++) {
+        for (int c = 0; c < (int)sizeof(q4kx8_t); c += 64) __builtin_prefetch((const uint8_t *)B + PF_DIST + c, 0, 3);
+        __m256i sumi[RP_NT];
+        for (int t = 0; t < NT; t++) sumi[t] = _mm256_setzero_si256();
+        for (int j = 0; j < 4; j++) {          // sub-blocks 2j (low nibbles) and 2j+1 (high nibbles)
+            __m256i il[RP_NT], ih[RP_NT];
+            for (int t = 0; t < NT; t++) { il[t] = _mm256_setzero_si256(); ih[t] = _mm256_setzero_si256(); }
+            for (int s = 0; s < 8; s++) {
+                __m256i v = _mm256_loadu_si256((const __m256i *)B->qs[j][s]);
+                __m256i vl = _mm256_and_si256(v, m4), vh = _mm256_and_si256(_mm256_srli_epi16(v, 4), m4);
+                for (int t = 0; t < NT; t++) {
+                    const int8_t *q8 = y[t][b].qs;
+                    int32_t a0, a1;
+                    memcpy(&a0, q8 + 64 * j + 4 * s, 4);
+                    memcpy(&a1, q8 + 64 * j + 32 + 4 * s, 4);
+                    il[t] = dp_u8s8_x8(il[t], vl, _mm256_set1_epi32(a0));
+                    ih[t] = dp_u8s8_x8(ih[t], vh, _mm256_set1_epi32(a1));
+                }
+            }
+            __m256i sl = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)B->sc[2 * j]));
+            __m256i sh = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)B->sc[2 * j + 1]));
+            for (int t = 0; t < NT; t++)
+                sumi[t] = _mm256_add_epi32(sumi[t], _mm256_add_epi32(_mm256_mullo_epi32(il[t], sl), _mm256_mullo_epi32(ih[t], sh)));
+        }
+#if defined(__F16C__)
+        __m256 d = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)B->d));
+        __m256 dm = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)B->dmin));
+#else
+        float df[8], dmf[8];
+        for (int r = 0; r < 8; r++) { df[r] = FP16(B->d[r]); dmf[r] = FP16(B->dmin[r]); }
+        __m256 d = _mm256_loadu_ps(df), dm = _mm256_loadu_ps(dmf);
+#endif
+        __m256i mn[4];
+        for (int p = 0; p < 4; p++) mn[p] = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)B->mn[p]));
+        for (int t = 0; t < NT; t++) {
+            __m256i mi = _mm256_setzero_si256();
+            for (int p = 0; p < 4; p++)
+                mi = _mm256_add_epi32(mi, _mm256_madd_epi16(mn[p], _mm256_set1_epi32(bsp[t][4 * b + p])));
+            __m256 yd = _mm256_set1_ps(y[t][b].d);
+            acc[t] = _mm256_fmadd_ps(_mm256_mul_ps(d, yd), _mm256_cvtepi32_ps(sumi[t]), acc[t]);
+            macc[t] = _mm256_fmadd_ps(_mm256_mul_ps(dm, yd), _mm256_cvtepi32_ps(mi), macc[t]);
+        }
+    }
+    for (int t = 0; t < NT; t++) _mm256_storeu_ps(out + 8 * t, _mm256_sub_ps(acc[t], macc[t]));
+}
+
+// NT is a constant in every call below, so the loops over tokens unroll and stay in registers
+static void dot_q40x8_n(int nt, const q40x8_t *B, const q8_blk_t *const *y, const int32_t *const *o8,
+                        int nb, float *out) {
+    switch (nt) {
+    case 1: dot_q40x8_nt(1, B, y, o8, nb, out); break;
+    case 2: dot_q40x8_nt(2, B, y, o8, nb, out); break;
+#if RP_NT >= 4
+    case 3: dot_q40x8_nt(3, B, y, o8, nb, out); break;
+    case 4: dot_q40x8_nt(4, B, y, o8, nb, out); break;
+#endif
+    }
+}
+static void dot_q4Kx8_n(int nt, const q4kx8_t *B, const q8k_blk_t *const *y, const int32_t *const *bsp,
+                        int nb, float *out) {
+    switch (nt) {
+    case 1: dot_q4Kx8_nt(1, B, y, bsp, nb, out); break;
+    case 2: dot_q4Kx8_nt(2, B, y, bsp, nb, out); break;
+#if RP_NT >= 4
+    case 3: dot_q4Kx8_nt(3, B, y, bsp, nb, out); break;
+    case 4: dot_q4Kx8_nt(4, B, y, bsp, nb, out); break;
+#endif
+    }
+}
+#else
+// portable build: the single-token kernels once per token (each group is still in cache)
+static void dot_q40x8_n(int nt, const q40x8_t *B, const q8_blk_t *const *y, const int32_t *const *o8,
+                        int nb, float *out) {
+    (void)o8;
+    for (int t = 0; t < nt; t++) dot_q40x8(B, y[t], nb, out + 8 * t);
+}
+static void dot_q4Kx8_n(int nt, const q4kx8_t *B, const q8k_blk_t *const *y, const int32_t *const *bsp,
+                        int nb, float *out) {
+    for (int t = 0; t < nt; t++) dot_q4Kx8(B, y[t], bsp[t], nb, out + 8 * t);
+}
+#endif
+
+// Y[i][b·ldy[i] + r] = dot(W_i[r], X[b·ldx ...]) for n ≤ 4 repacked matrices of the same type and
+// width that read the same nb ≤ RP_SMALL inputs (Q/K/V, gate/up): one parallel loop over all their
+// row groups, the inputs quantized once
+static void matmul_rp_small(int n, tensor_t *const *t, const float *X, int ldx, float *const *Y,
+                            const int *ldy, int nb) {
+    int cols = (int)t[0]->ne[0], q4k = t[0]->type == T_Q4_K;
+    int nbl = q4k ? cols / 256 : cols / 32;
+    size_t s8 = (size_t)g_max_cols / 32 + 1, sk = (size_t)g_max_cols / 256 + 1;
+    static int32_t *bsp;              // per token: min-term sums (Q4_K) or 8·Σy per block (Q4_0)
+    static size_t bsp_n;
+    if ((size_t)RP_SMALL * nbl * 4 > bsp_n) {
+        free(bsp);
+        bsp_n = (size_t)RP_SMALL * nbl * 4;
+        bsp = (int32_t *)malloc(bsp_n * sizeof(int32_t));
+    }
+    for (int b = 0; b < nb; b++) {
+        int32_t *o = bsp + (size_t)b * nbl * 4;
+        if (q4k) {
+            quantize_q8k(X + (size_t)b * ldx, g_bxq8k + b * sk, cols);
+            q4kx8_bsums(g_bxq8k + b * sk, nbl, o);
+        } else {
+            const q8_blk_t *y = g_bxq8 + b * s8;
+            quantize_q8(X + (size_t)b * ldx, g_bxq8 + b * s8, cols);
+            for (int k = 0; k < nbl; k++) o[k] = 8 * (y[k].s16[0] + y[k].s16[1]);
+        }
+    }
+    const q8_blk_t *yq[RP_SMALL];
+    const q8k_blk_t *yk[RP_SMALL];
+    const int32_t *yb[RP_SMALL];
+    for (int b = 0; b < nb; b++) { yq[b] = g_bxq8 + b * s8; yk[b] = g_bxq8k + b * sk; yb[b] = bsp + (size_t)b * nbl * 4; }
+    int64_t first[5] = { 0 };
+    for (int i = 0; i < n; i++) first[i + 1] = first[i] + (int64_t)t[i]->ne[1] / 8;
+    #pragma omp parallel for schedule(guided, 4)
+    for (int64_t gg = 0; gg < first[n]; gg++) {
+        int i = 0;
+        while (gg >= first[i + 1]) i++;
+        int64_t g = gg - first[i];
+        float o[RP_NT * 8];
+        for (int b0 = 0; b0 < nb; b0 += RP_NT) {
+            int nt = nb - b0 < RP_NT ? nb - b0 : RP_NT;
+            if (q4k) dot_q4Kx8_n(nt, (const q4kx8_t *)t[i]->rp + (size_t)g * nbl, yk + b0, yb + b0, nbl, o);
+            else     dot_q40x8_n(nt, (const q40x8_t *)t[i]->rp + (size_t)g * nbl, yq + b0, yb + b0, nbl, o);
+            for (int k = 0; k < nt; k++)
+                memcpy(Y[i] + (size_t)(b0 + k) * ldy[i] + 8 * g, o + 8 * k, 8 * sizeof(float));
+        }
+    }
+}
+
 static int matvec(tensor_t *t, const float *x, float *out) {
     // weights uploaded to the GPU are multiplied there — any failure disables the GPU and continues on the CPU
     if (t->gpu && g_gpu.state == 1) {
@@ -3003,9 +3216,13 @@ static void gemm_q32(tensor_t *t, int cols, int64_t rows, const q8_blk_t *xq, si
 // and multiplied with all nb inputs while it is still in cache (prompt processing)
 static int matmul(tensor_t *t, const float *X, int ldx, float *Y, int ldy, int nb) {
     if (nb == 1) return matvec(t, X, Y);
-    if ((t->gpu && g_gpu.state == 1) || (t->rp && nb < 8)) {
+    if (t->gpu && g_gpu.state == 1) {
         for (int b = 0; b < nb; b++)
             if (matvec(t, X + (size_t)b * ldx, Y + (size_t)b * ldy) != 0) return -1;
+        return 0;
+    }
+    if (t->rp && nb <= RP_SMALL) {   // a few tokens: the generation kernels, several tokens per load
+        matmul_rp_small(1, &t, X, ldx, &Y, &ldy, nb);
         return 0;
     }
     int cols = (int)t->ne[0];
@@ -3019,12 +3236,15 @@ static int matmul(tensor_t *t, const float *X, int ldx, float *Y, int ldy, int n
     for (int b = 0; b < nb; b++)
         quantize_act(kind, X + (size_t)b * ldx, g_bxq8 + b * s8, g_bxq8k + b * sk, cols);
 #if defined(__AVX2__)
-    // Q4_K / Q6_K with a real batch: unpack each row once, int8 GEMM with dpbusd
-    if (kind == ACT_Q8K && (t->type == T_Q4_K || t->type == T_Q6_K) && nb >= GV) {
+    // Q4_K / Q6_K with a real batch: unpack each row once, int8 GEMM with dpbusd. Not for the small
+    // batches of speculative decoding (≤ RP_SMALL): the GEMM sums in another order, and the tiled
+    // path below gives exactly the single-token result, so a checked token never differs from the
+    // token generation would have produced
+    if (kind == ACT_Q8K && (t->type == T_Q4_K || t->type == T_Q6_K) && nb > RP_SMALL) {
         gemm_kquant(t, cols, rows, g_bxq8k, sk, Y, ldy, nb);
         return 0;
     }
-    if (kind == ACT_Q8 && gemm_q32_type(t->type) && nb >= GV) {
+    if (kind == ACT_Q8 && gemm_q32_type(t->type) && nb > RP_SMALL) {
         gemm_q32(t, cols, rows, g_bxq8, s8, Y, ldy, nb);
         return 0;
     }
@@ -3059,6 +3279,7 @@ static int matmul(tensor_t *t, const float *X, int ldx, float *Y, int ldy, int n
                 int b1 = b0 + TT < nb ? b0 + TT : nb;
                 for (int64_t r = r0; r < r1; r++) {
                     const uint8_t *rb = raw + (uint64_t)r * stride;
+                    if (b0 == 0) prefetch_ahead(rb, stride);   // as in matvec: the rows ahead stream in
                     int b = b0;
                     if (x4k) {          // groups of 4 inputs share one unpacking of the weight row
                         for (; b + 4 <= b1; b += 4) {
@@ -3069,6 +3290,15 @@ static int matmul(tensor_t *t, const float *X, int ldx, float *Y, int ldy, int n
                             else                   dot_q6_K_q8k_x4(rb, yk, cols / 256, o);
                             for (int i = 0; i < 4; i++) Y[(size_t)(b + i) * ldy + r] = o[i];
                         }
+                        if (t->type == T_Q6_K && b1 - b >= 2) {   // 2 or 3 left: still one unpacking
+                            int nl = b1 - b;
+                            const q8k_blk_t *yk[3];
+                            float o[3];
+                            for (int i = 0; i < nl; i++) yk[i] = g_bxq8k + (b + i) * sk;
+                            dot_q6_K_q8k_xn(nl, rb, yk, cols / 256, o);
+                            for (int i = 0; i < nl; i++) Y[(size_t)(b + i) * ldy + r] = o[i];
+                            b = b1;
+                        }
                     } else if (x4q) {
                         for (; b + 4 <= b1; b += 4) {
                             const q8_blk_t *yq[4] = { g_bxq8 + b * s8, g_bxq8 + (b + 1) * s8,
@@ -3076,6 +3306,15 @@ static int matmul(tensor_t *t, const float *X, int ldx, float *Y, int ldy, int n
                             float o[4];
                             dot_q32_q8_x4(t->type, rb, yq, cols / 32, o);
                             for (int i = 0; i < 4; i++) Y[(size_t)(b + i) * ldy + r] = o[i];
+                        }
+                        if (b1 - b >= 2) {
+                            int nl = b1 - b;
+                            const q8_blk_t *yq[3];
+                            float o[3];
+                            for (int i = 0; i < nl; i++) yq[i] = g_bxq8 + (b + i) * s8;
+                            dot_q32_q8_xn(nl, t->type, rb, yq, cols / 32, o);
+                            for (int i = 0; i < nl; i++) Y[(size_t)(b + i) * ldy + r] = o[i];
+                            b = b1;
                         }
                     }
                     for (; b < b1; b++)
@@ -3089,6 +3328,20 @@ static int matmul(tensor_t *t, const float *X, int ldx, float *Y, int ldy, int n
         fprintf(stderr, "matmul: unsupported type %s in %s\n", type_name(t->type), t->name);
         return -1;
     }
+    return 0;
+}
+
+// up to 4 matrices that read the same nb inputs (Q/K/V, gate/up): small batches on repacked weights
+// of one type and width share one parallel loop, like matvec_multi; anything else goes one by one
+static int matmul_multi(int n, tensor_t *const *t, const float *X, int ldx, float *const *Y,
+                        const int *ldy, int nb) {
+    int fuse = n <= 4 && nb > 1 && nb <= RP_SMALL;
+    for (int i = 0; i < n && fuse; i++)
+        fuse = t[i] && t[i]->rp && !(t[i]->gpu && g_gpu.state == 1) &&
+               t[i]->type == t[0]->type && t[i]->ne[0] == t[0]->ne[0];
+    if (fuse) { matmul_rp_small(n, t, X, ldx, Y, ldy, nb); return 0; }
+    for (int i = 0; i < n; i++)
+        if (t[i] && matmul(t[i], X, ldx, Y[i], ldy[i], nb) != 0) return -1;
     return 0;
 }
 
@@ -4060,6 +4313,7 @@ static int sample_next(sampler_t *s, tok_t *tk, float *logits, int n_vocab,
 // =========================================================================
 
 #define MAX_LAYERS 128
+#define SPEC_MAX 8               // speculative decoding: most tokens drafted per step
 
 typedef struct {
     float *attn_norm;
@@ -4136,6 +4390,7 @@ typedef struct {
     // prompt batches (allocated on first use): FG_BATCH rows each; ld_* = row length
     float *bx, *bcur, *bq, *bk, *bv, *batt, *bao, *bf, *bgate, *bup, *bffn, *bscores;
     float *ascores; int ald;     // attn_rows scratch: 4 rows of ald floats per thread
+    float *blogits;              // speculative decoding: logits of every checked token [SPEC_MAX+1][n_vocab]
     int ld_q, ld_kv, ld_ff;
 } model_t;
 
@@ -4964,8 +5219,14 @@ static int forward_chunk(model_t *m, const int *toks, int nb, int pos0, int want
             rmsnorm_w(m->bcur + (size_t)b * E, L->attn_norm, E, m->norm_eps);
         }
 
-        // Q → (bias) → per-head norm → RoPE
-        if (matmul(L->wq, m->bcur, E, m->bq, LQ, nb) != 0) return -1;
+        // Q → (bias) → per-head norm → RoPE; Q, K and V in one pass when this layer owns its cache
+        int own_kv = il < m->n_kv_from_start;
+        if (own_kv) {
+            tensor_t *tq[3] = { L->wq, L->wk, L->wv };
+            float *oq[3] = { m->bq, m->bk, m->bv };
+            int lq[3] = { LQ, LKV, LKV };
+            if (matmul_multi(L->wv ? 3 : 2, tq, m->bcur, E, oq, lq, nb) != 0) return -1;
+        } else if (matmul(L->wq, m->bcur, E, m->bq, LQ, nb) != 0) return -1;
         #pragma omp parallel for schedule(static)
         for (int b = 0; b < nb; b++) {
             float *q = m->bq + (size_t)b * LQ;
@@ -4976,9 +5237,7 @@ static int forward_chunk(model_t *m, const int *toks, int nb, int pos0, int want
         }
 
         // K/V for owning layers, written into the cache for every token of the batch
-        if (il < m->n_kv_from_start) {
-            if (matmul(L->wk, m->bcur, E, m->bk, LKV, nb) != 0) return -1;
-            if (L->wv && matmul(L->wv, m->bcur, E, m->bv, LKV, nb) != 0) return -1;
+        if (own_kv) {
             #pragma omp parallel for schedule(static)
             for (int b = 0; b < nb; b++) {
                 float *k = m->bk + (size_t)b * LKV, *v = m->bv + (size_t)b * LKV;
@@ -5090,8 +5349,10 @@ static int forward_chunk(model_t *m, const int *toks, int nb, int pos0, int want
             for (int b = 0; b < nb; b++)
                 if (moe_ffn(m, L, m->bf + (size_t)b * E, m->bffn + (size_t)b * E) != 0) return -1;
         } else {
-            if (matmul(L->ffn_gate, m->bf, E, m->bgate, LF, nb) != 0) return -1;
-            if (matmul(L->ffn_up, m->bf, E, m->bup, LF, nb) != 0) return -1;
+            tensor_t *tf[2] = { L->ffn_gate, L->ffn_up };
+            float *of[2] = { m->bgate, m->bup };
+            int lf[2] = { LF, LF };
+            if (matmul_multi(2, tf, m->bf, E, of, lf, nb) != 0) return -1;
             int fd = L->ff_dim, gelu = m->act_gelu;
             #pragma omp parallel for schedule(static)
             for (int b = 0; b < nb; b++) {
@@ -5111,6 +5372,22 @@ static int forward_chunk(model_t *m, const int *toks, int nb, int pos0, int want
     }
 
     if (!want_logits) return 0;
+    if (want_logits == 2) {
+        // every token's logits (speculative decoding checks each drafted token): m->blogits[b]
+        if (nb > SPEC_MAX + 1) return -1;
+        if (!m->blogits && !(m->blogits = (float *)malloc((size_t)(SPEC_MAX + 1) * m->n_vocab * sizeof(float))))
+            return -1;
+        for (int b = 0; b < nb; b++) {
+            memcpy(m->bcur + (size_t)b * E, X + (size_t)b * E, E * sizeof(float));
+            rmsnorm_w(m->bcur + (size_t)b * E, m->output_norm, E, m->norm_eps);
+        }
+        if (matmul(m->output, m->bcur, E, m->blogits, m->n_vocab, nb) != 0) return -1;
+        if (m->final_softcap > 0.0f) {
+            float cp = m->final_softcap;
+            for (size_t i = 0; i < (size_t)nb * m->n_vocab; i++) m->blogits[i] = cp * tanhf(m->blogits[i] / cp);
+        }
+        return 0;
+    }
     // final norm + LM head + softcap — only the last token's logits are needed
     memcpy(m->x, X + (size_t)(nb - 1) * E, E * sizeof(float));
     rmsnorm_w(m->x, m->output_norm, E, m->norm_eps);
@@ -5140,6 +5417,193 @@ static float *forward_batch(model_t *m, const int *tokens, int n, int pos0) {
         if (forward_chunk(m, tokens + c, nb, pos0 + c, c + nb == n) != 0) return NULL;
     }
     return m->logits;
+}
+
+// =========================================================================
+// Speculative decoding with prompt lookup. Generating one token reads every weight once; checking
+// several tokens in one batch reads them once too (matmul_rp_small), so each correctly guessed token
+// is almost free. The guesses come from the conversation itself: if the last few tokens appeared
+// before, the tokens that followed them then are proposed now (code, quotes, lists, edits and
+// repeated names hit often). Every proposal is checked by the model with the same sampler, in order,
+// and kept only while it equals the token the sampler picks — so the text follows the same
+// distribution as without speculation. Batches of up to RP_SMALL tokens use kernels that give
+// bit-for-bit the single-token results, so with greedy sampling the text is exactly the same.
+// The draft length adapts to the measured cost of a check and to how often drafts are accepted;
+// when guessing does not pay, generation goes one token at a time as before.
+// FASTGGUF_SPEC=0 turns it off; FASTGGUF_SPEC=N drafts at most N tokens per step (1..SPEC_MAX).
+// =========================================================================
+
+#ifndef SPEC_DEFAULT
+#define SPEC_DEFAULT 8
+#endif
+#ifndef SPEC_NGRAM_MAX
+#define SPEC_NGRAM_MAX 4
+#endif
+#ifndef SPEC_NGRAM_MIN
+#define SPEC_NGRAM_MIN 2
+#endif
+
+// proposes up to maxk tokens following the most recent earlier occurrence of the last N tokens of
+// h[0..n-1] (N from SPEC_NGRAM_MAX down to SPEC_NGRAM_MIN), written to h[n..]; returns how many.
+// The copy may run into the tokens it is writing, so a repeating pattern continues past the end
+static int spec_draft(int *h, int n, int maxk) {
+    for (int N = SPEC_NGRAM_MAX; N >= SPEC_NGRAM_MIN; N--) {
+        if (n <= N) continue;
+        const int *suf = h + n - N;
+        for (int i = n - N - 1; i >= 0; i--) {
+            if (h[i] != suf[0] || memcmp(h + i, suf, (size_t)N * sizeof(int)) != 0) continue;
+            for (int k = 0; k < maxk; k++) h[n + k] = h[i + N + k];   // i + N + k < n + k: already set
+            return maxk;
+        }
+    }
+    return 0;
+}
+
+// how many tokens to draft per step for this model (0 = speculation off)
+static int spec_limit(model_t *m) {
+    const char *se = getenv("FASTGGUF_SPEC"), *be = getenv("FASTGGUF_BATCH");
+    int k = se ? atoi(se) : SPEC_DEFAULT;
+    if (k > SPEC_MAX) k = SPEC_MAX;
+    if (k <= 0 || (be && (strcmp(be, "0") == 0 || strcmp(be, "off") == 0))) return 0;
+    // the batched path is needed, and it only pays off where small batches are cheap: not on the GPU
+    // (one token at a time there) and not for MoE (each token reads its own experts)
+    if (m->n_ple > 0 || m->kvq == 2 || m->n_expert > 0 || (g_gpu.state == 1 && g_gpu.n_offloaded > 0)) return 0;
+    if (batch_alloc(m) != 0) return 0;
+    return k;
+}
+
+typedef struct {
+    model_t *m; sampler_t *s; tok_t *tk;
+    int *hist;          // hist[p] = token at position p (the caller's array)
+    int *pos;           // tokens in the KV cache (the caller's counter)
+    float *logits;      // the prompt's logits, for the first token
+    int pending;        // the last token handed out, not yet in the cache (-1: none yet)
+    int left;           // tokens the caller may still take (< 0: no limit)
+    int spec;           // most tokens drafted per step (0: one token at a time)
+    int queue[SPEC_MAX + 1], qn, qi;   // tokens decided by the last check, not handed out yet
+    int n_steps, n_drafted, n_accepted;
+    // draft length control: measured time per batch of n tokens, and how often a draft is accepted
+    double tn[SPEC_MAX + 2];          // running average, seconds (0: not measured yet)
+    double acc_s, acc_t;              // decayed counts: drafts accepted / drafts that were decided
+    int since_plain, since_probe;
+} gen_t;
+
+static void gen_init(gen_t *g, model_t *m, sampler_t *s, tok_t *tk, int *hist, int *pos,
+                     float *logits, int max_tokens) {
+    memset(g, 0, sizeof(*g));
+    g->m = m; g->s = s; g->tk = tk; g->hist = hist; g->pos = pos; g->logits = logits;
+    g->pending = -1;
+    g->left = max_tokens > 0 ? max_tokens : -1;
+    g->spec = spec_limit(m);
+    g->acc_s = 1.0; g->acc_t = 2.0;   // prior: half of the drafts accepted
+}
+
+// cost of checking n tokens in one batch: measured, else estimated from the closest measured
+// batch with the cost per extra token it shows (prior: 0.3 of a token)
+static double gen_cost(const gen_t *g, int n) {
+    if (g->tn[n] > 0) return g->tn[n];
+    double t1 = g->tn[1] > 0 ? g->tn[1] : 1.0, beta = 0.3;
+    for (int d = 1; d <= SPEC_MAX; d++) {
+        int a = n - d, b = n + d;
+        if (a > 1 && g->tn[a] > 0) { beta = (g->tn[a] / t1 - 1.0) / (a - 1); break; }
+        if (b <= SPEC_MAX + 1 && g->tn[b] > 0) { beta = (g->tn[b] / t1 - 1.0) / (b - 1); break; }
+    }
+    if (beta < 0.02) beta = 0.02;
+    return t1 * (1.0 + beta * (n - 1));
+}
+
+// the number of tokens to draft (≤ maxk) with the most expected tokens per second: with acceptance
+// rate a, k drafts give 1 + a + … + a^k tokens per check. 0 when one token at a time is faster —
+// then every 16th step still tries one draft, so a change (say, the reply starts quoting) is noticed
+static int gen_choose(gen_t *g, int maxk) {
+    if (maxk <= 0) return 0;
+    if (g->tn[1] <= 0 || g->since_plain >= 32) return 0;   // measure the plain step now and then
+    double a = g->acc_s / g->acc_t, best = 1.0 / g->tn[1], e = 1.0, ap = 1.0;
+    int bk = 0;
+    for (int k = 1; k <= maxk; k++) {
+        ap *= a; e += ap;
+        double r = e / gen_cost(g, k + 1);
+        if (r > best * 1.02) { best = r; bk = k; }
+    }
+    if (bk == 0 && ++g->since_probe >= 16) { g->since_probe = 0; bk = 1; }
+    return bk;
+}
+
+static void gen_time(gen_t *g, int n, double dt) {
+    g->tn[n] = g->tn[n] > 0 ? 0.8 * g->tn[n] + 0.2 * dt : dt;
+}
+
+static int gen_take(gen_t *g, int t) {
+    if (g->left > 0) g->left--;
+    return t;
+}
+
+// the next token of the reply (it may be a stop token: the caller stops there), -1 on an error,
+// -2 when the context is full. Tokens handed out are in the cache except the last one (pending)
+static int gen_next(gen_t *g) {
+    model_t *m = g->m;
+    if (g->qi < g->qn) return gen_take(g, g->queue[g->qi++]);
+    if (g->pending < 0) {
+        g->pending = sample_next(g->s, g->tk, g->logits, m->n_vocab, g->hist, *g->pos);
+        return gen_take(g, g->pending);
+    }
+    int pos = *g->pos, p = g->pending;
+    if (pos >= m->n_ctx) return -2;
+    g->hist[pos] = p;
+    // drafts: written into hist right after the pending token (the positions they would take)
+    int maxk = g->spec, k = 0;
+    if (maxk > m->n_ctx - pos - 1) maxk = m->n_ctx - pos - 1;
+    if (g->left >= 0 && maxk > g->left - 1) maxk = g->left - 1;
+    if (maxk > 0 && (k = spec_draft(g->hist, pos + 1, maxk)) > 0) k = gen_choose(g, k);
+    g->qn = g->qi = 0;
+    double t0 = now_sec();
+    if (k == 0) {
+        float *lg = forward(m, p, pos);
+        if (!lg) return -1;
+        gen_time(g, 1, now_sec() - t0);
+        g->since_plain = 0;
+        *g->pos = pos + 1;
+        g->pending = sample_next(g->s, g->tk, lg, m->n_vocab, g->hist, pos + 1);
+        return gen_take(g, g->pending);
+    }
+    // the pending token and the drafts in one batch; logits after each of them
+    int toks[SPEC_MAX + 1];
+    toks[0] = p;
+    memcpy(toks + 1, g->hist + pos + 1, (size_t)k * sizeof(int));
+    if (forward_chunk(m, toks, k + 1, pos, 2) != 0) return -1;
+    gen_time(g, k + 1, now_sec() - t0);
+    g->since_plain++;
+    int i = 0;
+    for (; i <= k; i++) {
+        int t = sample_next(g->s, g->tk, m->blogits + (size_t)i * m->n_vocab, m->n_vocab, g->hist, pos + i + 1);
+        g->queue[g->qn++] = t;
+        if (i == k || t != toks[i + 1] || tok_is_stop(g->tk, t)) break;   // the first token that differs
+    }
+    g->n_steps++; g->n_drafted += k; g->n_accepted += i;
+    // acceptance per decided draft: the first rejected one counts, the ones after it were not decided
+    g->acc_s = 0.85 * g->acc_s + i;
+    g->acc_t = 0.85 * g->acc_t + i + (i < k);
+    *g->pos = pos + 1 + i;            // the pending token + the i accepted drafts are in the cache
+    g->pending = g->queue[g->qn - 1];
+    return gen_take(g, g->queue[g->qi++]);
+}
+
+// after the caller stopped taking tokens: put the last one handed out into the cache too, so the
+// conversation can continue from it (not a stop token, which ends the reply)
+static int gen_finish(gen_t *g) {
+    if (g->qi < g->qn) {              // stopped inside a checked run: drop the tokens not handed out
+        *g->pos -= g->qn - 1 - g->qi;
+        g->qn = g->qi = 0;
+        g->pending = -1;
+        return 0;
+    }
+    int p = g->pending, pos = *g->pos;
+    g->pending = -1;
+    if (p < 0 || tok_is_stop(g->tk, p) || pos >= g->m->n_ctx) return 0;
+    if (!forward(g->m, p, pos)) return -1;
+    g->hist[pos] = p;
+    *g->pos = pos + 1;
+    return 0;
 }
 
 // =========================================================================
@@ -5290,28 +5754,33 @@ static int cmd_chat(const char *path, int n_ctx, int max_tokens, sampler_t *smp)
         double t_prompt = now_sec() - t0;
 
         double t1 = now_sec();
-        int n_gen = 0;
-        for (int i = 0; max_tokens <= 0 || i < max_tokens; i++) {
-            int next = sample_next(smp, &tk, logits, m->n_vocab, hist, pos);
+        int n_gen = 0, err = 0;
+        gen_t gen;
+        gen_init(&gen, m, smp, &tk, hist, &pos, logits, max_tokens);
+        for (;;) {
+            if (max_tokens > 0 && n_gen >= max_tokens) break;
+            int next = gen_next(&gen);
+            if (next == -2) { out_flush_pending(); printf("\n[context full]"); break; }
+            if (next < 0) { err = 1; break; }
             if (tok_is_stop(&tk, next)) break;
             tok_print(&tk, next);
             fflush(stdout);
             n_gen++;
-            if (pos >= n_ctx) { out_flush_pending(); printf("\n[context full]"); break; }
-            logits = forward(m, next, pos);
-            if (!logits) {
-                out_flush_pending();
-                printf("\n[ERROR in gen - conversation reset]\n");
-                pos = 0;
-                break;
-            }
-            hist[pos++] = next;
+        }
+        if (!err && gen_finish(&gen) != 0) err = 1;
+        if (err) {
+            out_flush_pending();
+            printf("\n[ERROR in gen - conversation reset]\n");
+            pos = 0;
         }
         out_flush_pending();
         double t_gen = now_sec() - t1;
         printf("\n[prompt: %.1fs (%.2f tok/s) | gen: %d tok @ %.2f tok/s]\n",
                t_prompt, n_ids / (t_prompt > 0 ? t_prompt : 1),
                n_gen, n_gen / (t_gen > 0 ? t_gen : 1));
+        if (gen.n_steps > 0)
+            printf("[speculative: %d of %d drafted tokens accepted in %d checks]\n",
+                   gen.n_accepted, gen.n_drafted, gen.n_steps);
     }
     return 0;
 }
@@ -5688,9 +6157,11 @@ static int cmd_selftest(void) {
     fails += test_kquant("Q6_K", T_Q6_K, 210, dot_q6_K_q8k);
 
     // --- prompt-batch GEMM: matmul() against the single-input kernel on the same quantized
-    //     inputs; odd row count and a batch that is not a multiple of 32 exercise every path
-    {
-        int cols = 512, rows = 37, nbt = 45;
+    //     inputs; odd row count and a batch that is not a multiple of 32 exercise every path, and
+    //     small batches (speculative decoding) the tiled path with its 2/3/4-input kernels
+    static const int gemm_nbt[7] = { 45, 2, 3, 6, 7, 9, RP_SMALL };
+    for (int ni = 0; ni < 7; ni++) {
+        int cols = 512, rows = 37, nbt = gemm_nbt[ni];
         matvec_init_scratch(cols);
         static const struct { uint32_t type; const char *name; int bytes, blk; } gt[7] = {
             { T_Q4_K, "Q4_K", 144, 256 }, { T_Q6_K, "Q6_K", 210, 256 }, { T_Q4_0, "Q4_0", 18, 32 },
@@ -5730,8 +6201,9 @@ static int cmd_selftest(void) {
                     if (fabs(ref) > ymax) ymax = fabs(ref);
                 }
             double rel = emax / (ymax + 1e-9);
-            int ok = rel < 1e-5 && !fail;
-            printf("%-5s batch GEMM vs single kernel: rel_err=%.2e %s\n", gt[k].name, rel, ok ? "OK" : "FAIL");
+            // small batches must match exactly (speculative decoding relies on it)
+            int ok = (nbt <= RP_SMALL ? emax == 0 : rel < 1e-5) && !fail;
+            printf("%-5s batch of %2d vs single kernel: rel_err=%.2e %s\n", gt[k].name, nbt, rel, ok ? "OK" : "FAIL");
             if (!ok) fails++;
             free(w);
         }
@@ -5821,6 +6293,65 @@ static int cmd_selftest(void) {
                udiff ? "DIFFERENT" : "identical", ok ? "OK" : "FAIL");
         if (!ok) fails++;
         free(w); free(x); free(xq); free(rpk);
+    }
+
+    // --- small batches on repacked weights (speculative decoding): matmul() and matmul_multi() for
+    //     2..RP_SMALL tokens must give exactly what matvec() gives token by token ---
+    for (int k = 0; k < 2; k++) {
+        int q4k = k == 0, cols = q4k ? 512 : 320, rows = 24, rows2 = 16;
+        int nbl = q4k ? cols / 256 : cols / 32, bbytes = q4k ? 144 : 18;
+        uint64_t stride = (uint64_t)nbl * bbytes;
+        matvec_init_scratch(cols);
+        tensor_t t[2];
+        uint8_t *w[2];
+        for (int i = 0; i < 2; i++) {
+            int r_i = i ? rows2 : rows;
+            w[i] = (uint8_t *)malloc(stride * r_i);
+            for (uint64_t j = 0; j < stride * r_i; j++) w[i][j] = (uint8_t)(rand() & 0xFF);
+            for (int b = 0; b < r_i * nbl; b++) {
+                uint16_t h = (uint16_t)(0x2C00 + (rand() & 0x3FF)), h2 = (uint16_t)(0x2400 + (rand() & 0x3FF));
+                memcpy(w[i] + (size_t)b * bbytes, &h, 2);
+                if (q4k) memcpy(w[i] + (size_t)b * bbytes + 2, &h2, 2);
+            }
+            size_t gb = (size_t)nbl * (q4k ? sizeof(q4kx8_t) : sizeof(q40x8_t));
+            uint8_t *rp = (uint8_t *)malloc(gb * (r_i / 8));
+            for (int g = 0; g < r_i / 8; g++) {
+                if (q4k) repack_q4K_group(w[i] + (uint64_t)g * 8 * stride, stride, nbl, (q4kx8_t *)(rp + g * gb));
+                else     repack_q40_group(w[i] + (uint64_t)g * 8 * stride, stride, nbl, (q40x8_t *)(rp + g * gb));
+            }
+            memset(&t[i], 0, sizeof(t[i]));
+            snprintf(t[i].name, sizeof(t[i].name), "selftest.small%d", i);
+            t[i].type = q4k ? T_Q4_K : T_Q4_0; t[i].n_dims = 2; t[i].ne[0] = cols; t[i].ne[1] = r_i;
+            t[i].data = w[i]; t[i].nbytes = stride * r_i; t[i].rp = rp;
+        }
+        float *X = (float *)malloc((size_t)RP_SMALL * cols * sizeof(float));
+        float *Y0 = (float *)malloc((size_t)RP_SMALL * rows * sizeof(float));
+        float *Y1 = (float *)malloc((size_t)RP_SMALL * rows2 * sizeof(float));
+        float ref[24];
+        for (int i = 0; i < RP_SMALL * cols; i++) X[i] = (float)(rand() % 2000 - 1000) / 500.0f;
+        int bad = 0;
+        for (int nbt = 2; nbt <= RP_SMALL; nbt++) {
+            matmul(&t[0], X, cols, Y0, rows, nbt);
+            for (int b = 0; b < nbt; b++) {
+                matvec(&t[0], X + (size_t)b * cols, ref);
+                if (memcmp(ref, Y0 + (size_t)b * rows, rows * sizeof(float)) != 0) bad = 1;
+            }
+            tensor_t *tp[2] = { &t[0], &t[1] };
+            float *yp[2] = { Y0, Y1 };
+            int ld[2] = { rows, rows2 };
+            matmul_multi(2, tp, X, cols, yp, ld, nbt);
+            for (int b = 0; b < nbt; b++) {
+                matvec(&t[0], X + (size_t)b * cols, ref);
+                if (memcmp(ref, Y0 + (size_t)b * rows, rows * sizeof(float)) != 0) bad = 1;
+                matvec(&t[1], X + (size_t)b * cols, ref);
+                if (memcmp(ref, Y1 + (size_t)b * rows2, rows2 * sizeof(float)) != 0) bad = 1;
+            }
+        }
+        printf("%s  repacked small batch (2..%d tokens) vs single: %s %s\n", q4k ? "Q4_K" : "Q4_0",
+               RP_SMALL, bad ? "DIFFERENT" : "identical", bad ? "FAIL" : "OK");
+        fails += bad;
+        for (int i = 0; i < 2; i++) { free(w[i]); free((void *)t[i].rp); }
+        free(X); free(Y0); free(Y1);
     }
 
     // --- attention rows (QK tiles, softmax, value sum) against a plain double computation; ring
@@ -6501,7 +7032,8 @@ static char *run_engine(engine_t *e, msg_t *msgs, int n_msgs, int max_tokens,
             if (!m->is_swa[il]) continue;
             int oldest_needed = keep + 1 - m->n_swa;
             if (oldest_needed < 0) oldest_needed = 0;
-            int oldest_resident = m->seq_len - m->cache_cap[il];
+            // + SPEC_MAX: rejected drafts may have been written past seq_len
+            int oldest_resident = m->seq_len + SPEC_MAX - m->cache_cap[il];
             if (oldest_resident < 0) oldest_resident = 0;
             if (oldest_needed < oldest_resident) keep = 0;
             break;
@@ -6526,14 +7058,11 @@ static char *run_engine(engine_t *e, msg_t *msgs, int n_msgs, int max_tokens,
     }
 
     // ingest the prompt from the point of divergence, in batches
-    int pos = keep;
     m->seq_len = keep;
     double t0 = now_sec();
     float *logits = forward_batch(m, ids + keep, n_ids - keep, keep);
-    if (logits) {
+    if (logits)
         for (int i = keep; i < n_ids; i++) m->seq_ids[m->seq_len++] = ids[i];
-        pos = n_ids;
-    }
     free(ids);
     if (!logits) { *status = 2; return NULL; }
     double t_prompt = now_sec() - t0;
@@ -6543,9 +7072,13 @@ static char *run_engine(engine_t *e, msg_t *msgs, int n_msgs, int max_tokens,
     int n_gen = 0;
     double t1 = now_sec();
 
+    // m->seq_len follows the cache through the generator; the last token handed out is not in the
+    // cache (the next request re-reads it as part of its prompt — no need to compute it now)
+    gen_t gen;
+    gen_init(&gen, m, sp, tk, m->seq_ids, &m->seq_len, logits, max_tokens);
     for (int i = 0; i < max_tokens; i++) {
-        int next = sample_next(sp, tk, logits, m->n_vocab, m->seq_ids, m->seq_len);
-        if (tok_is_stop(tk, next)) break;
+        int next = gen_next(&gen);
+        if (next < 0 || tok_is_stop(tk, next)) break;
         int tn = tok_text(tk, next, tbuf, sizeof(tbuf));
         if (tn > 0) {
             if (out_n + tn + 1 > out_cap) { out_cap *= 2; out_txt = (char *)realloc(out_txt, out_cap); }
@@ -6563,15 +7096,15 @@ static char *run_engine(engine_t *e, msg_t *msgs, int n_msgs, int max_tokens,
             }
         }
         n_gen++;
-        logits = forward(m, next, pos);
-        if (!logits) break;
-        m->seq_ids[m->seq_len++] = next;
-        pos++;
     }
+    gen.pending = -1;                  // see above: not put into the cache
+    if (gen.qi < gen.qn) gen_finish(&gen);
     double t_gen = now_sec() - t1;
-    printf("[%s] done: prompt %.1fs (%.1f t/s, %d reused) | gen %d tok @ %.2f t/s\n",
+    printf("[%s] done: prompt %.1fs (%.1f t/s, %d reused) | gen %d tok @ %.2f t/s",
            e->name, t_prompt, (n_ids - keep) / (t_prompt > 0 ? t_prompt : 1), keep,
            n_gen, n_gen / (t_gen > 0 ? t_gen : 1));
+    if (gen.n_steps > 0) printf(" | speculative %d/%d accepted", gen.n_accepted, gen.n_drafted);
+    printf("\n");
 
     out_txt[out_n] = 0;
     *out_prompt_toks = n_ids;

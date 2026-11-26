@@ -8,6 +8,10 @@ nothing has to be downloaded. You can also pass real .gguf files.
     python tools/bench.py qwen2.5-0.5b:q4_0 llama-3.2-1b:q4_k_m
     python tools/bench.py --gguf path/to/model.gguf
     OMP_NUM_THREADS=2 python tools/bench.py ...    # limit threads
+    python tools/bench.py --spec --gguf model.gguf  # with speculative decoding
+
+Speculative decoding is off unless --spec is given: random weights make a model repeat itself, which
+would make prompt lookup look far better than on real text (and llama-bench does not speculate).
 """
 import argparse
 import json
@@ -56,6 +60,7 @@ def main():
     ap.add_argument("--tokens", type=int, default=128, help="tokens to generate per run")
     ap.add_argument("--runs", type=int, default=2, help="runs per model, best is kept")
     ap.add_argument("--json", help="also write results to this file")
+    ap.add_argument("--spec", action="store_true", help="keep speculative decoding on (meaningful with real models only)")
     a = ap.parse_args()
 
     mdir = Path(a.models)
@@ -70,6 +75,8 @@ def main():
         jobs.append((spec, path))
 
     env = dict(os.environ)
+    if not a.spec:
+        env["FASTGGUF_SPEC"] = "0"
     threads = env.get("OMP_NUM_THREADS") or str(os.cpu_count())
     print(f"\nCPU: {cpu_name()} | threads: {threads} | ctx {a.ctx} | {a.tokens} tokens x {a.runs} runs\n")
     print(f"| {'model':28s} | {'size':>8s} | {'gen tok/s':>9s} |")
