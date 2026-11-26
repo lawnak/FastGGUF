@@ -90,7 +90,7 @@ jobs:
             server.bat
 
   macos-arm64:
-    runs-on: macos-14
+    runs-on: macos-latest   # Apple Silicon; a pinned version stops working when GitHub retires it
     steps:
       - uses: actions/checkout@v4
       # Apple clang has no OpenMP and Apple Silicon has no AVX2: single-thread scalar path
